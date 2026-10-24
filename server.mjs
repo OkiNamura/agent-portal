@@ -64,6 +64,7 @@ bus.on("event", ({ runId, entry }) => {
   if (entry.kind === "error" && t.agentError) push(`«${name}»: ошибка прогона — ${entry.message}`, "error", "bad");
   if (entry.kind === "call_failed" && t.agentError) push(`«${name}»: агент ${entry.agent} не ответил (${entry.callKind})`, "error", "bad");
   if (entry.kind === "done" && t.runFinished) push(`«${name}»: прогон завершён`, "done", "info");
+  if (entry.kind === "stage_done" && t.stageDone) push(`«${name}»: ${String(entry.message).toLowerCase()}`, "stage", "info");
   if (entry.kind === "call_done" && t.slowCall && Number(entry.ms) > Number(harness.thresholds?.slowCallMs ?? 60_000)) {
     push(`«${name}»: ${entry.agent} думал ${(Number(entry.ms) / 1000).toFixed(0)} с — это долго`, "slow", "warn");
   }
