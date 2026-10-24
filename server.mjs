@@ -12,6 +12,8 @@ import { isMock } from "./lib/llm.mjs";
 import { listModels, chat } from "./lib/openrouter.mjs";
 import { diffWorkspaces } from "./lib/diff.mjs";
 import { agentMetrics, verdictSummary } from "./lib/metrics.mjs";
+import { Mailbox } from "./lib/mailbox.mjs";
+import { collectAlerts } from "./lib/watch.mjs";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 loadEnv(ROOT);
@@ -47,6 +49,25 @@ const projects = new Projects(ROOT);
 const bus = new EventEmitter();
 bus.setMaxListeners(200);
 const engine = new Engine({ store, config, bus });
+
+const mailbox = new Mailbox(ROOT);
+let harness = readJson(path.join(CONFIG_DIR, "harness.json"));
+
+/* ---------- что будит Харнесса: события портала → почтовый ящик ---------- */
+bus.on("event", ({ runId, entry }) => {
+  const t = harness.triggers ?? {};
+  const project = projects.byRun(runId);
+  const name = project?.name ?? runId;
+  const push = (text, kind, level) => mailbox.add({ from: "system", text, kind, level, runId, projectId: project?.id ?? null });
+
+  if (entry.kind === "gate" && t.gateAwaiting) push(`«${name}»: ждёт подтверждения — ${String(entry.message).replace(/^Нужно подтверждение: /, "")}`, "gate", "warn");
+  if (entry.kind === "error" && t.agentError) push(`«${name}»: ошибка прогона — ${entry.message}`, "error", "bad");
+  if (entry.kind === "call_failed" && t.agentError) push(`«${name}»: агент ${entry.agent} не ответил (${entry.callKind})`, "error", "bad");
+  if (entry.kind === "done" && t.runFinished) push(`«${name}»: прогон завершён`, "done", "info");
+  if (entry.kind === "call_done" && t.slowCall && Number(entry.ms) > Number(harness.thresholds?.slowCallMs ?? 60_000)) {
+    push(`«${name}»: ${entry.agent} думал ${(Number(entry.ms) / 1000).toFixed(0)} с — это долго`, "slow", "warn");
+  }
+});
 
 /* ---------- recovery: runs left "running" by a restart ---------- */
 for (const r of store.list()) {
@@ -398,6 +419,19 @@ const server = http.createServer(async (req, res) => {
 
       const run = store.create(task, { base, change, projectId });
       projects.attach(projectId, run.id);
+      if (harness.triggers?.projectStart) {
+        const proj = projects.get(projectId);
+        mailbox.add({
+          from: "system",
+          text: change
+            ? `«${proj?.name ?? projectId}»: доработка — ${change}`
+            : `«${proj?.name ?? projectId}»: старт проекта — ${task.slice(0, 120)}`,
+          kind: "start",
+          level: "info",
+          runId: run.id,
+          projectId,
+        });
+      }
       json(res, 201, { run: snapshot(run) });
       engine.start(run).catch((err) => console.error("[engine]", err));
       return;
@@ -556,6 +590,54 @@ const server = http.createServer(async (req, res) => {
         verdicts: verdictSummary(runs),
         runs: runs.length,
       });
+    }
+
+    if (pathname === "/api/alerts" && req.method === "GET") {
+      const runs = allRuns();
+      return json(res, 200, {
+        alerts: collectAlerts({
+          runs,
+          metrics: { agents: agentMetrics(runs) },
+          harness,
+          projects: projects.list(),
+          stages: config.pipeline.stages,
+        }),
+      });
+    }
+
+    if (pathname === "/api/mailbox" && req.method === "GET") {
+      return json(res, 200, { items: mailbox.list(100), unread: mailbox.unread() });
+    }
+
+    if (pathname === "/api/mailbox" && req.method === "POST") {
+      const body = await readBody(req);
+      const text = String(body.text ?? "").trim();
+      if (!text) return json(res, 400, { error: "Пустое сообщение" });
+      const from = body.from === "harness" ? "harness" : body.from === "system" ? "system" : "user";
+      const item = mailbox.add({ from, text, kind: "chat" });
+      return json(res, 200, { item, unread: mailbox.unread() });
+    }
+
+    if (pathname === "/api/mailbox/read" && req.method === "POST") {
+      const body = await readBody(req);
+      mailbox.markRead(Array.isArray(body.ids) ? body.ids : []);
+      return json(res, 200, { ok: true, unread: mailbox.unread() });
+    }
+
+    if (pathname === "/api/harness" && req.method === "GET") {
+      return json(res, 200, { harness });
+    }
+
+    if (pathname === "/api/harness" && req.method === "POST") {
+      const body = await readBody(req);
+      harness = {
+        ...harness,
+        ...body,
+        triggers: { ...(harness.triggers ?? {}), ...(body.triggers ?? {}) },
+        thresholds: { ...(harness.thresholds ?? {}), ...(body.thresholds ?? {}) },
+      };
+      fs.writeFileSync(path.join(CONFIG_DIR, "harness.json"), JSON.stringify(harness, null, 2), "utf8");
+      return json(res, 200, { harness });
     }
 
     if (pathname === "/api/assistant" && req.method === "POST") {

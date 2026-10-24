@@ -30,6 +30,7 @@ const S = {
   modelsTried: false,
   logCutoff: 0,
   metrics: null,
+  corner: { items: [], unread: 0, alerts: [] },
   diff: { runId: null, data: null, file: null },
   tab: "flow",
   view: "mockup",
@@ -63,8 +64,10 @@ async function boot() {
     else newProjectMode();
     pollTasks();
     pollLogs();
+    pollCorner();
     setInterval(pollTasks, 4000);
     setInterval(pollLogs, 6000);
+    setInterval(pollCorner, 20000);
   } catch (err) {
     $("#runStatus").textContent = "ошибка загрузки: " + err.message;
   }
@@ -384,6 +387,7 @@ function renderAgentEditor() {
 
   box.append(card);
   renderAgentStats(a);
+  if (a.id === "harness") renderHarnessSettings(a);
   if (!S.models.length && !S.modelsTried) {
     S.modelsTried = true;
     loadModels().then(() => {
@@ -392,8 +396,7 @@ function renderAgentEditor() {
   }
 }
 
-async function renderAgentStats(a) {
-  const box = $("#agentEditor");
+async function renderAgentStats(a) {  const box = $("#agentEditor");
   const { agents } = await loadMetrics();
   const m = agents.find((x) => x.id === a.id);
   if (S.editingAgent?.id !== a.id) return;
@@ -1291,6 +1294,126 @@ async function loadDiff(run) {
   }
 }
 
+/* --------------------------- угловой чат --------------------------- */
+
+async function pollCorner() {
+  try {
+    const [mb, al] = await Promise.all([api("/api/mailbox?limit=60"), api("/api/alerts")]);
+    S.corner = { items: mb.items ?? [], unread: mb.unread ?? 0, alerts: al.alerts ?? [] };
+    const badge = $("#cornerBadge");
+    const total = (S.corner.unread ?? 0) + (S.corner.alerts ?? []).length;
+    badge.classList.toggle("hidden", total === 0);
+    badge.textContent = total > 99 ? "99+" : String(total);
+    if (!$("#cornerPanel").classList.contains("hidden")) renderCorner();
+  } catch {
+    /* сервер занят */
+  }
+}
+
+function renderCorner() {
+  const box = $("#cornerLog");
+  box.textContent = "";
+  for (const m of S.corner.items.slice(-40)) {
+    const node = el("div", "cmsg " + m.from, m.text);
+    const who = m.from === "user" ? "ты" : m.from === "harness" ? "харнесс" : m.from === "assistant" ? "ассистент портала" : "портал";
+    node.prepend(el("span", "who", `${who} · ${hhmmss(m.at)}`));
+    box.append(node);
+  }
+  if (!S.corner.items.length) box.append(el("div", "empty", "тут появятся события портала и наша переписка"));
+
+  const alerts = $("#cornerAlerts");
+  alerts.textContent = "";
+  for (const a of S.corner.alerts) alerts.append(el("div", "alert " + (a.level === "bad" ? "bad" : ""), a.text));
+  box.scrollTop = box.scrollHeight;
+}
+
+async function sendCorner() {
+  const input = $("#cornerInput");
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = "";
+  $("#cornerSend").disabled = true;
+  try {
+    await api("/api/mailbox", { method: "POST", body: JSON.stringify({ text, from: "user" }) });
+    const reply = await api("/api/assistant", { method: "POST", body: JSON.stringify({ question: text }) }).catch(() => null);
+    if (reply?.answer) await api("/api/mailbox", { method: "POST", body: JSON.stringify({ text: reply.answer, from: "assistant" }) });
+    await pollCorner();
+  } catch (err) {
+    pushLog({ at: new Date().toISOString(), kind: "error", message: err.message });
+  } finally {
+    $("#cornerSend").disabled = false;
+  }
+}
+
+async function renderHarnessSettings(a) {
+  const box = $("#agentEditor");
+  let harness;
+  try {
+    ({ harness } = await api("/api/harness"));
+  } catch {
+    return;
+  }
+  if (S.editingAgent?.id !== a.id) return;
+
+  const card = el("div", "card");
+  card.append(el("div", "sectionTitle", "Когда будить Харнесса"));
+  card.append(el("div", "dim", "Галочки: на какие события он получает сообщение в угловой чат. Решение по-прежнему за тобой."));
+
+  const labels = {
+    projectStart: "старт проекта или доработки",
+    gateAwaiting: "прогон ждёт согласования",
+    stageDone: "стадия завершена",
+    runFinished: "прогон закончен",
+    agentError: "ошибка агента",
+    slowCall: "агент думает дольше порога",
+  };
+  const triggers = { ...(harness.triggers ?? {}) };
+  for (const [key, label] of Object.entries(labels)) {
+    const row = el("label", "chk");
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = Boolean(triggers[key]);
+    cb.addEventListener("change", () => (triggers[key] = cb.checked));
+    row.append(cb, el("span", null, label));
+    card.append(row);
+  }
+
+  const thresholds = { ...(harness.thresholds ?? {}) };
+  const grid = el("div", "grid2");
+  const mk = (title, key, scale = 1) => {
+    const l = el("label", "label", title);
+    const i = document.createElement("input");
+    i.type = "number";
+    i.value = String((thresholds[key] ?? 0) / scale);
+    i.addEventListener("input", () => (thresholds[key] = Number(i.value) * scale));
+    l.append(i);
+    grid.append(l);
+  };
+  mk("долгий ответ, сек", "slowCallMs", 1000);
+  mk("зависло, мин", "stuckMinutes");
+  mk("дневной лимит, $", "dailyBudget");
+  card.append(grid);
+
+  const save = el("button", "primary", "Сохранить триггеры");
+  save.addEventListener("click", async () => {
+    save.disabled = true;
+    try {
+      await api("/api/harness", { method: "POST", body: JSON.stringify({ triggers, thresholds }) });
+      save.textContent = "Сохранено";
+      pollCorner();
+    } catch (err) {
+      save.textContent = "Ошибка: " + err.message;
+    } finally {
+      setTimeout(() => {
+        save.disabled = false;
+        save.textContent = "Сохранить триггеры";
+      }, 1500);
+    }
+  });
+  card.append(save);
+  box.append(card);
+}
+
 /* ------------------------------ wiring ------------------------------ */
 
 document.querySelectorAll("#nav button").forEach((b) => b.addEventListener("click", () => setPage(b.dataset.page)));
@@ -1338,6 +1461,23 @@ $("#clearGlobalLog").addEventListener("click", () => {
 });
 $("#askInput").addEventListener("keydown", (e) => {
   if (e.key === "Enter") ask();
+});
+
+$("#cornerBtn").addEventListener("click", async () => {
+  const panel = $("#cornerPanel");
+  panel.classList.toggle("hidden");
+  if (!panel.classList.contains("hidden")) {
+    renderCorner();
+    $("#cornerInput").focus();
+    await pollCorner();
+    api("/api/mailbox/read", { method: "POST", body: JSON.stringify({ ids: [] }) }).catch(() => {});
+    setTimeout(pollCorner, 800);
+  }
+});
+$("#cornerClose").addEventListener("click", () => $("#cornerPanel").classList.add("hidden"));
+$("#cornerSend").addEventListener("click", sendCorner);
+$("#cornerInput").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") sendCorner();
 });
 
 boot();

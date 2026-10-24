@@ -165,6 +165,25 @@
   </aside>
 </div>
 
+<button id="cornerBtn" class="cornerBtn" title="Чат с Харнессом и проблемы портала">
+  <span>✎</span><span id="cornerBadge" class="cornerBadge hidden">0</span>
+</button>
+
+<div id="cornerPanel" class="cornerPanel hidden">
+  <div class="cornerHead">
+    <b>Харнесс</b>
+    <span class="dim" id="cornerStatus">наблюдает</span>
+    <span class="spacer"></span>
+    <button id="cornerClose" class="mini">✕</button>
+  </div>
+  <div id="cornerAlerts" class="cornerAlerts"></div>
+  <div id="cornerLog" class="cornerLog"></div>
+  <div class="cornerInput">
+    <input id="cornerInput" placeholder="Написать Харнессу…" />
+    <button id="cornerSend" class="primary">→</button>
+  </div>
+</div>
+
 <script src="app.js"></script>
 </body>
 </html>

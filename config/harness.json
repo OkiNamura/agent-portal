@@ -1,0 +1,16 @@
+{
+  "triggers": {
+    "projectStart": true,
+    "gateAwaiting": true,
+    "stageDone": false,
+    "runFinished": true,
+    "agentError": true,
+    "slowCall": true
+  },
+  "thresholds": {
+    "slowCallMs": 60000,
+    "stuckMinutes": 15,
+    "dailyBudget": 2
+  },
+  "note": "Что будит Харнесса: события портала превращаются в сообщения в угловом чате."
+}
