@@ -11,6 +11,7 @@ import { Engine } from "./lib/engine.mjs";
 import { isMock } from "./lib/llm.mjs";
 import { listModels, chat } from "./lib/openrouter.mjs";
 import { diffWorkspaces } from "./lib/diff.mjs";
+import { agentMetrics, verdictSummary } from "./lib/metrics.mjs";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 loadEnv(ROOT);
@@ -147,6 +148,20 @@ function snapshot(run) {
 
 function projectList() {
   return projects.list().map((p) => withRuns(p));
+}
+
+function allRuns() {
+  const out = [];
+  for (const p of projects.list()) {
+    for (const id of p.runIds) {
+      try {
+        out.push(store.load(id));
+      } catch {
+        /* прогон удалён */
+      }
+    }
+  }
+  return out;
 }
 
 function buildStats() {
@@ -532,6 +547,15 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === "/api/stats" && req.method === "GET") {
       return json(res, 200, { stats: buildStats() });
+    }
+
+    if (pathname === "/api/metrics" && req.method === "GET") {
+      const runs = allRuns();
+      return json(res, 200, {
+        agents: agentMetrics(runs),
+        verdicts: verdictSummary(runs),
+        runs: runs.length,
+      });
     }
 
     if (pathname === "/api/assistant" && req.method === "POST") {

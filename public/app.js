@@ -29,6 +29,7 @@ const S = {
   models: [],
   modelsTried: false,
   logCutoff: 0,
+  metrics: null,
   diff: { runId: null, data: null, file: null },
   tab: "flow",
   view: "mockup",
@@ -382,12 +383,42 @@ function renderAgentEditor() {
   card.append(actions);
 
   box.append(card);
+  renderAgentStats(a);
   if (!S.models.length && !S.modelsTried) {
     S.modelsTried = true;
     loadModels().then(() => {
       if (S.models.length && S.editingAgent?.id === a.id) renderAgentEditor();
     });
   }
+}
+
+async function renderAgentStats(a) {
+  const box = $("#agentEditor");
+  const { agents } = await loadMetrics();
+  const m = agents.find((x) => x.id === a.id);
+  if (S.editingAgent?.id !== a.id) return;
+  const card = el("div", "card");
+  card.append(el("div", "sectionTitle", "Статистика агента"));
+  if (!m) {
+    card.append(el("div", "empty", "Пока не вызывался."));
+  } else {
+    const facts = el("div", "facts");
+    facts.append(
+      el("span", null, `вызовов: ${m.attempts}`),
+      el("span", null, `ошибок: ${m.failed}`),
+      el("span", null, `средний ответ: ${fmtMs(m.avgMs)}`),
+      el("span", null, `правок: ${m.fixes}`),
+      el("span", null, `проверок: ${m.verdicts.pass}/${m.verdicts.fail}`),
+      el("span", null, `стоимость: $${m.cost.toFixed(4)}`)
+    );
+    card.append(facts);
+    if (m.failed > 0) {
+      const warn = el("div", "empty", `Ошибок ${m.failed} из ${m.attempts} вызовов — повод сменить модель или промт.`);
+      warn.style.color = "var(--warn)";
+      card.append(warn);
+    }
+  }
+  box.append(card);
 }
 
 async function loadModels() {
@@ -461,6 +492,8 @@ async function loadStats() {
     add(String(stats.byStatus.done ?? 0), "завершено");
     box.append(cards);
 
+    await renderAgentMetrics(box);
+
     if (stats.byModel.length) {
       box.append(el("div", "sectionTitle", "По моделям"));
       const t = el("table", "tbl");
@@ -522,6 +555,60 @@ const td = (text, cls) => {
   c.textContent = text;
   return c;
 };
+
+/* --------------------------- метрики агентов --------------------------- */
+
+async function loadMetrics({ force = false } = {}) {
+  if (S.metrics && !force) return S.metrics;
+  try {
+    S.metrics = await api("/api/metrics");
+  } catch {
+    S.metrics = { agents: [], verdicts: null, runs: 0 };
+  }
+  return S.metrics;
+}
+
+const fmtMs = (ms) => (ms == null ? "—" : ms < 1000 ? `${ms} мс` : `${(ms / 1000).toFixed(1)} с`);
+
+async function renderAgentMetrics(box) {
+  const { agents, verdicts } = await loadMetrics({ force: true });
+  if (!agents.length) return;
+
+  box.append(el("div", "sectionTitle", "По агентам: кто работает, кто косячит"));
+  const t = el("table", "tbl");
+  t.innerHTML =
+    "<thead><tr><th>Агент</th><th>Модель</th><th>Вызовов</th><th>Ошибок</th><th>Средний ответ</th><th>Правок</th><th>Проверки</th><th>Стоимость</th></tr></thead>";
+  const tb = document.createElement("tbody");
+  for (const a of agents) {
+    const tr = document.createElement("tr");
+    const cfg = S.agents.find((x) => x.id === a.id);
+    tr.append(td(cfg?.name ?? a.id, "name"));
+    tr.append(td(a.model ?? "—"));
+    tr.append(td(String(a.attempts)));
+    const errTd = td(a.failed ? `${a.failed} (${Math.round(a.failRate * 100)}%)` : "0");
+    errTd.style.color = a.failed ? "var(--bad)" : "var(--dim)";
+    tr.append(errTd);
+    tr.append(td(fmtMs(a.avgMs)));
+    tr.append(td(String(a.fixes)));
+    const v = a.verdicts.pass + a.verdicts.fail ? `${a.verdicts.pass}/${a.verdicts.fail}` : "—";
+    tr.append(td(v));
+    tr.append(td(`$${a.cost.toFixed(4)}`));
+    tb.append(tr);
+  }
+  t.append(tb);
+  box.append(t);
+
+  if (verdicts && verdicts.total) {
+    const pct = Math.round(verdicts.passRate * 100);
+    box.append(
+      el(
+        "div",
+        "diffSummary",
+        `Проверок: ${verdicts.total} · с первого раза: ${verdicts.pass} (${pct}%) · с дефектами: ${verdicts.fail} · блоков принято: ${verdicts.blocksVerified}, провалено: ${verdicts.blocksFailed}`
+      )
+    );
+  }
+}
 
 /* -------------------------------- runs -------------------------------- */
 
