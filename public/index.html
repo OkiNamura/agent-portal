@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Agent Portal</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="top">
+  <div class="brand"><span class="logo">◈</span><span>AGENT&nbsp;PORTAL</span></div>
+  <div class="meta">
+    <span id="modeBadge" class="badge">…</span>
+    <span class="cost" title="Потрачено на все прогоны">$<span id="cost">0.0000</span></span>
+  </div>
+</header>
+
+<div class="app">
+  <!-- 1: верхний уровень меню -->
+  <nav class="nav" id="nav">
+    <button data-page="projects" class="active"><span class="ico">▣</span><span>Проекты</span></button>
+    <button data-page="agents"><span class="ico">◈</span><span>Агенты</span></button>
+    <button data-page="stats"><span class="ico">▤</span><span>Статистика</span></button>
+    <button data-page="assistant"><span class="ico">✎</span><span>Ассистент</span></button>
+  </nav>
+
+  <!-- 2: список выбранного раздела -->
+  <aside class="list" id="list"></aside>
+
+  <!-- 3: рабочая область -->
+  <main class="workspace">
+    <!-- ПРОЕКТЫ -->
+    <div id="pageProjects" class="page">
+      <div id="projectHead" class="projectHead"></div>
+      <nav class="tabs" id="tabs">
+        <button data-tab="flow" class="active">Ход</button>
+        <button data-tab="mockup">Макет</button>
+        <button data-tab="files">Файлы</button>
+        <span class="spacer"></span>
+        <button id="stopRun" class="mini danger hidden">■ Остановить</button>
+        <span id="runStatus" class="runStatus"></span>
+      </nav>
+      <div class="tabBody">
+        <div id="tabFlow" class="tabPane">
+          <div id="composer" class="composer hidden">
+            <label class="label" for="task">Новый проект</label>
+            <input id="projectName" placeholder="Название проекта" />
+            <textarea id="task" rows="3" placeholder="Что нужно сделать? Опиши результат, а не способ."></textarea>
+            <div class="row">
+              <button id="start" class="primary">Запустить каскад</button>
+              <span id="hint" class="hint">Декомпозиция → спеки → макет → код → проверка.</span>
+            </div>
+          </div>
+          <div id="gate" class="gate hidden"></div>
+          <div id="iterate" class="iterate hidden">
+            <div class="iterHead"><b>Доработка</b><span class="dim">проект уже есть — агенты правят его, а не начинают с нуля</span></div>
+            <div class="row">
+              <input id="changeInput" placeholder="Что изменить?" />
+              <button id="iterateBtn" class="primary">Доработать</button>
+            </div>
+          </div>
+          <div class="blocksWrap">
+            <div class="sectionHead">Блоки <span id="planTitle" class="dim"></span></div>
+            <div id="blocks" class="blocks"></div>
+          </div>
+          <div class="console">
+            <div class="consoleHead"><span>Лог прогона</span><span class="spacer"></span><button id="clearLog" class="mini">очистить</button></div>
+            <div id="log" class="log"></div>
+          </div>
+        </div>
+
+        <div id="tabMockup" class="tabPane hidden">
+          <div class="previewBar">
+            <div class="seg">
+              <button data-view="mockup" class="active">Макет</button>
+              <button data-view="app">Результат</button>
+            </div>
+            <span class="spacer"></span>
+            <button id="reloadPreview" class="mini">обновить</button>
+            <a id="openPreview" class="mini link" target="_blank" href="#">открыть в новой вкладке</a>
+          </div>
+          <div id="previewEmpty" class="previewEmpty hidden">Макет появится на стадии «Макет и дизайн».</div>
+          <iframe id="preview" class="preview" sandbox="allow-scripts allow-same-origin allow-forms" referrerpolicy="no-referrer"></iframe>
+        </div>
+
+        <div id="tabFiles" class="tabPane hidden filesPane">
+          <div id="artifacts" class="artifacts"></div>
+          <div class="viewer">
+            <div class="viewerHead"><span id="viewerTitle" class="dim">выбери файл</span><span class="spacer"></span><button id="rawToggle" class="mini hidden">raw</button></div>
+            <div id="viewerBody" class="viewerBody"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- АГЕНТЫ -->
+    <div id="pageAgents" class="page hidden">
+      <div class="pageHead">
+        <h1>Агенты и модели</h1>
+        <div class="dim">Клик по агенту слева — настройка. Модель подтягивается из OpenRouter, промт можно править.</div>
+      </div>
+      <div id="agentEditor" class="agentEditor"></div>
+    </div>
+
+    <!-- СТАТИСТИКА -->
+    <div id="pageStats" class="page hidden">
+      <div class="pageHead">
+        <h1>Статистика</h1>
+        <div class="dim">Считается по всем прогонам: расход, модели, проекты, дни.</div>
+      </div>
+      <div id="statsBody" class="statsBody"></div>
+    </div>
+
+    <!-- АССИСТЕНТ -->
+    <div id="pageAssistant" class="page hidden">
+      <div class="pageHead">
+        <h1>Ассистент по порталу</h1>
+        <div class="dim">Знает проекты, версии, статусы, гейты, ошибки и расход. Спрашивай словами.</div>
+      </div>
+      <div id="chatBox" class="chatBox">
+        <div id="chatLog" class="chatLog"></div>
+        <div class="chatInput">
+          <input id="askInput" placeholder="Где остановился проект «Заметки»? Были ли ошибки?" />
+          <button id="askBtn" class="primary">Спросить</button>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- 4: пайплайн, прогоны, задачи, логи -->
+  <aside class="rail" id="rail">
+    <details open>
+      <summary>Пайплайн</summary>
+      <ol id="stages" class="stages"></ol>
+    </details>
+    <details open>
+      <summary>Прогоны</summary>
+      <div id="runs" class="runs"></div>
+    </details>
+    <details open>
+      <summary>Текущие задачи</summary>
+      <div id="tasks" class="tasks"></div>
+    </details>
+    <details>
+      <summary>Логи</summary>
+      <div class="logTools"><button id="clearGlobalLog" class="mini">сбросить</button></div>
+      <div id="globalLog" class="globalLog"></div>
+    </details>
+  </aside>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

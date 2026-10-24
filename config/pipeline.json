@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 3,
+  "maxFixRounds": 2,
+  "testCommand": "",
+  "note": "gate=true — прогон останавливается и ждёт подтверждения. Оставлены только два смысловых гейта: план и макет. Спеки, код и сводка идут автоматически.",
+  "stages": [
+    {
+      "id": "plan",
+      "title": "Декомпозиция",
+      "agent": "orchestrator",
+      "kind": "plan",
+      "gate": true,
+      "hint": "Кто и что делает: блоки, цели, критерии приёмки"
+    },
+    {
+      "id": "spec",
+      "title": "Спеки блоков",
+      "agent": "architect",
+      "kind": "spec",
+      "perBlock": true,
+      "gate": false
+    },
+    {
+      "id": "mockup",
+      "title": "Макет и дизайн",
+      "agent": "mockup",
+      "kind": "mockup",
+      "gate": true,
+      "hint": "Как проект будет выглядеть — одно утверждение на весь проект"
+    },
+    {
+      "id": "build",
+      "title": "Реализация",
+      "agent": "coder",
+      "kind": "build",
+      "perBlock": true
+    },
+    {
+      "id": "verify",
+      "title": "Проверка и правки",
+      "agent": "tester",
+      "kind": "verify",
+      "perBlock": true
+    },
+    {
+      "id": "report",
+      "title": "Сводка",
+      "agent": "critic",
+      "kind": "report",
+      "gate": false
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "name": "agent-portal",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Локальная коробка: портал с агентами и оркестратором поверх OpenRouter",
+  "scripts": {
+    "start": "node server.mjs",
+    "mock": "node server.mjs --mock",
+    "dev": "node --watch server.mjs"
+  },
+  "engines": { "node": ">=20" }
+}
