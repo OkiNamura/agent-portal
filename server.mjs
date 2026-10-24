@@ -8,7 +8,7 @@ import { loadEnv } from "./lib/env.mjs";
 import { Store, safeRel } from "./lib/store.mjs";
 import { Projects } from "./lib/projects.mjs";
 import { Engine } from "./lib/engine.mjs";
-import { isMock } from "./lib/llm.mjs";
+import { isMock, extractJson } from "./lib/llm.mjs";
 import { listModels, chat } from "./lib/openrouter.mjs";
 import { diffWorkspaces } from "./lib/diff.mjs";
 import { agentMetrics, verdictSummary } from "./lib/metrics.mjs";
@@ -646,6 +646,107 @@ const server = http.createServer(async (req, res) => {
       };
       fs.writeFileSync(path.join(CONFIG_DIR, "harness.json"), JSON.stringify(harness, null, 2), "utf8");
       return json(res, 200, { harness });
+    }
+
+    if (pathname === "/api/studio/thread" && req.method === "GET") {
+      return json(res, 200, { thread: studio.threadList(80) });
+    }
+
+    if (pathname === "/api/studio/propose" && req.method === "POST") {
+      const body = await readBody(req);
+      const text = String(body.text ?? "").trim();
+      if (text.length < 2) return json(res, 400, { error: "Пустой запрос" });
+      if (isMock()) return json(res, 502, { error: "MOCK-режим: художник не работает без ключа" });
+
+      studio.threadAdd({ role: "user", text, ref: body.referenceId ?? null });
+      const models = await imageModels().catch(() => []);
+      const agent = engine.agent("artist");
+      // только «обычные» text-to-image модели: векторные и редакторы требуют референс и падают на чистом промте
+      const blocked = /(vector|krea|edit|upscal|inpaint)/i;
+      const list = models
+        .map((m) => m.id)
+        .filter((id) => !blocked.test(id))
+        .slice(0, 40)
+        .join(", ");
+
+      try {
+        const out = await chat({
+          model: agent.model,
+          temperature: Number(agent.temperature ?? 0.4),
+          maxTokens: 900,
+          system: agent.prompt,
+          user: `Запрос заказчика: "${text}"\n\nДоступные модели картинок: ${list}\n\nВерни СТРОГО JSON: {"prompt":"подробный промт для модели","model":"id модели из списка","aspectRatio":"1:1|16:9|9:16|4:3|3:4|3:2","quality":"auto|low|medium|high","why":"одной фразой по-русски, как ты понял задачу"}`,
+        });
+        const data = extractJson(out.text);
+        const proposal = studio.threadAdd({
+          role: "proposal",
+          prompt: String(data.prompt ?? text),
+          model: String(data.model ?? "google/gemini-3.1-flash-image"),
+          aspectRatio: String(data.aspectRatio ?? "1:1"),
+          quality: String(data.quality ?? "auto"),
+          why: String(data.why ?? ""),
+          cost: out.usage.cost,
+        });
+        return json(res, 200, { proposal, thread: studio.threadList(80) });
+      } catch (err) {
+        return json(res, 502, { error: String(err?.message || err) });
+      }
+    }
+
+    if (pathname === "/api/studio/generate" && req.method === "POST") {
+      const body = await readBody(req, 14_000_000);
+      const prompt = String(body.prompt ?? "").trim();
+      if (prompt.length < 2) return json(res, 400, { error: "Пустой промт" });
+      if (isMock()) return json(res, 502, { error: "MOCK-режим: картинки не генерируются без ключа" });
+
+      const references = [];
+      let refId = null;
+      if (body.referenceId) {
+        const item = studio.get(String(body.referenceId));
+        if (!item) return json(res, 404, { error: "Референс не найден" });
+        references.push(studio.dataUrl(item));
+        refId = item.id;
+      }
+
+      const requested = String(body.model ?? "google/gemini-3.1-flash-image");
+      try {
+        let out;
+        let usedModel = requested;
+        try {
+          out = await generateImage({
+            model: requested,
+            prompt,
+            aspectRatio: body.aspectRatio ? String(body.aspectRatio) : undefined,
+            quality: body.quality ? String(body.quality) : undefined,
+            references,
+          });
+        } catch (err) {
+          // модель может не поддерживать параметры — один раз пробуем надёжную с минимальным набором
+          if (requested === "google/gemini-3.1-flash-image") throw err;
+          usedModel = "google/gemini-3.1-flash-image";
+          out = await generateImage({
+            model: usedModel,
+            prompt,
+            aspectRatio: body.aspectRatio ? String(body.aspectRatio) : undefined,
+            references,
+          });
+        }
+        const item = studio.add({
+          prompt,
+          model: usedModel,
+          aspectRatio: body.aspectRatio ?? null,
+          quality: body.quality ?? null,
+          mediaType: out.mediaType,
+          b64: out.b64,
+          cost: out.cost,
+          ms: out.ms,
+          refId,
+        });
+        const msg = studio.threadAdd({ role: "result", text: prompt, imageId: item.id, file: item.file, cost: item.cost, ms: item.ms, model: item.model, ref: refId });
+        return json(res, 200, { item, message: msg, url: `/studio/${item.file}`, thread: studio.threadList(80) });
+      } catch (err) {
+        return json(res, 502, { error: String(err?.message || err) });
+      }
     }
 
     if (pathname === "/api/images/models" && req.method === "GET") {

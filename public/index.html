@@ -156,8 +156,11 @@
             📎<input type="file" id="imgFile" accept="image/*" hidden />
           </label>
           <div id="imgChip" class="chip hidden"></div>
-          <textarea id="imgPrompt" rows="2" placeholder="Что нарисовать? Или что поправить в прикреплённой картинке?"></textarea>
-          <button id="imgSend" class="primary">Создать</button>
+          <textarea id="imgPrompt" rows="2" placeholder="Опиши, что хочешь — художник перепишет это в промт и покажет, что отправит"></textarea>
+          <label class="chk" title="Отправить мой текст в модель как есть, без художника">
+            <input type="checkbox" id="imgDirect" /> без художника
+          </label>
+          <button id="imgSend" class="primary">Художник</button>
         </div>
       </div>
     </div>

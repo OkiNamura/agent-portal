@@ -30,7 +30,7 @@ const S = {
   modelsTried: false,
   logCutoff: 0,
   metrics: null,
-  studio: { items: [], models: [], refItem: null, refData: null },
+  studio: { thread: [], models: [], refItem: null, refData: null, lastText: "" },
   corner: { items: [], unread: 0, alerts: [] },
   diff: { runId: null, data: null, file: null },
   tab: "flow",
@@ -201,60 +201,131 @@ async function loadStudio() {
     }
   }
   try {
-    const { items } = await api("/api/images?limit=40");
-    S.studio.items = items ?? [];
-    renderStudio();
+    const { thread } = await api("/api/studio/thread");
+    S.studio.thread = thread ?? [];
+    renderThread();
   } catch (err) {
     $("#studioInfo").textContent = err.message;
   }
 }
 
-function renderStudio() {
+function lastResultId() {
+  for (let i = S.studio.thread.length - 1; i >= 0; i--) {
+    if (S.studio.thread[i].role === "result") return S.studio.thread[i].imageId;
+  }
+  return null;
+}
+
+function renderThread() {
   const box = $("#studioFeed");
   box.textContent = "";
-  if (!S.studio.items.length) {
-    box.append(el("div", "empty", "Пока ничего не нарисовано. Напиши запрос внизу — например «обложка для калькулятора, минимализм, тёмная тема»."));
+  if (!S.studio.thread.length) {
+    box.append(el("div", "empty", "Опиши, что хочешь — художник перепишет это в промт, покажет, что отправит, и нарисует после твоего «Отправить»."));
     return;
   }
-  const total = S.studio.items.reduce((sum, i) => sum + (i.cost || 0), 0);
-  $("#studioInfo").textContent = `картинок: ${S.studio.items.length} · потрачено $${total.toFixed(3)}`;
+  const spent = S.studio.thread.filter((m) => m.role === "result").reduce((s, m) => s + (m.cost || 0), 0);
+  $("#studioInfo").textContent = `картинок: ${S.studio.thread.filter((m) => m.role === "result").length} · потрачено $${spent.toFixed(3)}`;
 
-  for (const item of S.studio.items) {
-    const card = el("div", "shot");
-    const img = document.createElement("img");
-    img.src = `/studio/${item.file}?v=${item.id}`;
-    img.loading = "lazy";
-    img.alt = item.prompt.slice(0, 60);
-    card.append(img);
-    card.append(el("div", "prompt", item.prompt));
-
-    const meta = el("div", "meta");
-    meta.append(
-      el("span", null, item.model),
-      el("span", null, `${(item.size / 1024).toFixed(0)} КБ`),
-      el("span", null, `$${(item.cost || 0).toFixed(3)}`),
-      el("span", null, `${(item.ms / 1000).toFixed(1)} с`),
-      el("span", null, new Date(item.at).toLocaleString("ru-RU"))
-    );
-    card.append(meta);
-
-    const acts = el("div", "acts");
-    const again = el("button", "mini", "переделать");
-    again.addEventListener("click", () => {
-      S.studio.refItem = item;
-      S.studio.refData = null;
-      renderChip();
-      $("#imgPrompt").value = item.prompt;
-      $("#imgPrompt").focus();
-    });
-    const dl = el("a", "mini link", "скачать");
-    dl.href = `/studio/${item.file}`;
-    dl.download = item.file;
-    acts.append(again, dl);
-    card.append(acts);
-
-    box.append(card);
+  for (const msg of S.studio.thread) {
+    if (msg.role === "user") {
+      box.append(el("div", "bubble user", msg.text));
+    } else if (msg.role === "proposal") {
+      box.append(proposalCard(msg));
+    } else if (msg.role === "result") {
+      box.append(resultCard(msg));
+    }
   }
+  box.scrollTop = box.scrollHeight;
+}
+
+function proposalCard(msg) {
+  const card = el("div", "proposal");
+  if (msg.why) card.append(el("div", "why", "Понял так: " + msg.why));
+
+  const ta = el("textarea", "pText");
+  ta.value = msg.prompt;
+  ta.rows = 4;
+  card.append(ta);
+
+  const row = el("div", "pRow");
+  const model = document.createElement("select");
+  model.className = "miniSelect";
+  for (const m of S.studio.models) {
+    const o = document.createElement("option");
+    o.value = m.id;
+    o.textContent = m.name;
+    model.append(o);
+  }
+  model.value = msg.model;
+
+  const aspect = document.createElement("select");
+  aspect.className = "miniSelect";
+  for (const a of ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2"]) {
+    const o = document.createElement("option");
+    o.value = a;
+    o.textContent = a;
+    aspect.append(o);
+  }
+  aspect.value = msg.aspectRatio ?? "1:1";
+
+  row.append(model, aspect);
+
+  const refId = lastResultId();
+  let refBox = null;
+  if (refId) {
+    const lab = el("label", "chk");
+    refBox = document.createElement("input");
+    refBox.type = "checkbox";
+    refBox.checked = true;
+    lab.append(refBox, el("span", null, "править прошлую картинку"));
+    row.append(lab);
+  }
+
+  const go = el("button", "primary", "Отправить");
+  go.addEventListener("click", () => submitProposal(msg, { prompt: ta.value.trim(), model: model.value, aspectRatio: aspect.value, referenceId: refBox?.checked ? refId : null }, go));
+
+  const alt = el("button", "mini", "ещё вариант");
+  alt.addEventListener("click", () => proposeAgain(msg));
+
+  row.append(go, alt);
+  card.append(row);
+  return card;
+}
+
+function resultCard(msg) {
+  const card = el("div", "shot");
+  const img = document.createElement("img");
+  img.src = `/studio/${msg.file}?v=${msg.imageId}`;
+  img.loading = "lazy";
+  img.alt = msg.text?.slice(0, 60) ?? "картинка";
+  card.append(img);
+  card.append(el("div", "prompt", msg.text ?? ""));
+
+  const meta = el("div", "meta");
+  meta.append(
+    el("span", null, msg.model ?? ""),
+    el("span", null, `$${(msg.cost || 0).toFixed(3)}`),
+    el("span", null, `${((msg.ms || 0) / 1000).toFixed(1)} с`),
+    el("span", null, msg.ref ? "по референсу" : "с нуля"),
+    el("span", null, new Date(msg.at).toLocaleString("ru-RU"))
+  );
+  card.append(meta);
+
+  const acts = el("div", "acts");
+  const again = el("button", "mini", "переделать");
+  again.addEventListener("click", () => {
+    S.studio.refItem = S.studio.models && { id: msg.imageId, file: msg.file };
+    S.studio.refData = null;
+    renderChip();
+    $("#imgPrompt").value = msg.text ?? "";
+    $("#imgPrompt").focus();
+  });
+  const dl = el("a", "mini link", "скачать");
+  dl.href = `/studio/${msg.file}`;
+  dl.download = msg.file;
+  acts.append(again, dl);
+  card.append(acts);
+  return card;
 }
 
 function renderChip() {
@@ -279,37 +350,79 @@ function renderChip() {
   chip.append(img, kill);
 }
 
-async function sendImage() {
-  const prompt = $("#imgPrompt").value.trim();
-  if (prompt.length < 2) {
+async function sendStudio() {
+  const text = $("#imgPrompt").value.trim();
+  if (text.length < 2) {
     $("#imgPrompt").focus();
     return;
   }
+  const direct = $("#imgDirect").checked;
   const btn = $("#imgSend");
   btn.disabled = true;
-  $("#studioInfo").innerHTML = '<span class="spin"></span> рисую…';
-  const body = {
-    prompt,
-    model: $("#imgModel").value,
-    aspectRatio: $("#imgAspect").value,
-    quality: $("#imgQuality").value,
-  };
-  if (S.studio.refItem && !S.studio.refData) body.referenceId = S.studio.refItem.id;
-  if (S.studio.refData) body.reference = S.studio.refData;
-
+  $("#studioInfo").innerHTML = `<span class="spin"></span> ${direct ? "рисую…" : "художник пишет промт…"}`;
   try {
-    const { item } = await api("/api/images", { method: "POST", body: JSON.stringify(body) });
-    S.studio.items.unshift(item);
+    let thread;
+    if (direct) {
+      const body = {
+        prompt: text,
+        model: $("#imgModel").value,
+        aspectRatio: $("#imgAspect").value,
+        quality: $("#imgQuality").value,
+      };
+      if (S.studio.refItem?.id) body.referenceId = S.studio.refItem.id;
+      ({ thread } = await api("/api/studio/generate", { method: "POST", body: JSON.stringify(body) }));
+    } else {
+      const body = { text };
+      if (S.studio.refItem?.id) body.referenceId = S.studio.refItem.id;
+      ({ thread } = await api("/api/studio/propose", { method: "POST", body: JSON.stringify(body) }));
+    }
+    S.studio.thread = thread ?? [];
+    S.studio.lastText = text;
+    $("#imgPrompt").value = "";
     S.studio.refItem = null;
     S.studio.refData = null;
-    $("#imgPrompt").value = "";
     renderChip();
-    renderStudio();
+    renderThread();
   } catch (err) {
     $("#studioInfo").textContent = err.message;
     pushLog({ at: new Date().toISOString(), kind: "error", message: err.message });
   } finally {
     btn.disabled = false;
+  }
+}
+
+async function submitProposal(msg, values, btn) {
+  btn.disabled = true;
+  $("#studioInfo").innerHTML = '<span class="spin"></span> рисую…';
+  const body = { prompt: values.prompt, model: values.model, aspectRatio: values.aspectRatio, quality: msg.quality ?? "auto" };
+  if (values.referenceId) body.referenceId = values.referenceId;
+  try {
+    const { thread } = await api("/api/studio/generate", { method: "POST", body: JSON.stringify(body) });
+    S.studio.thread = thread ?? [];
+    renderThread();
+  } catch (err) {
+    $("#studioInfo").textContent = err.message;
+    btn.disabled = false;
+  }
+}
+
+async function proposeAgain(msg) {
+  const idx = S.studio.thread.indexOf(msg);
+  let text = S.studio.lastText;
+  for (let i = idx - 1; i >= 0; i--) {
+    if (S.studio.thread[i].role === "user") {
+      text = S.studio.thread[i].text;
+      break;
+    }
+  }
+  if (!text) return;
+  $("#studioInfo").innerHTML = '<span class="spin"></span> художник думает…';
+  try {
+    const { thread } = await api("/api/studio/propose", { method: "POST", body: JSON.stringify({ text }) });
+    S.studio.thread = thread ?? [];
+    renderThread();
+  } catch (err) {
+    $("#studioInfo").textContent = err.message;
   }
 }
 
@@ -1601,11 +1714,11 @@ $("#askInput").addEventListener("keydown", (e) => {
   if (e.key === "Enter") ask();
 });
 
-$("#imgSend").addEventListener("click", sendImage);
+$("#imgSend").addEventListener("click", sendStudio);
 $("#imgPrompt").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
-    sendImage();
+    sendStudio();
   }
 });
 $("#imgFile").addEventListener("change", (e) => {
