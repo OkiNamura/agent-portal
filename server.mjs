@@ -10,6 +10,7 @@ import { Projects } from "./lib/projects.mjs";
 import { Engine } from "./lib/engine.mjs";
 import { isMock } from "./lib/llm.mjs";
 import { listModels, chat } from "./lib/openrouter.mjs";
+import { diffWorkspaces } from "./lib/diff.mjs";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 loadEnv(ROOT);
@@ -541,7 +542,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, answer);
     }
 
-    const m = pathname.match(/^\/api\/runs\/([\w.-]+)(?:\/(events|approve|cancel|resume|artifact|plan))?$/);
+    const m = pathname.match(/^\/api\/runs\/([\w.-]+)(?:\/(events|approve|cancel|resume|artifact|plan|diff))?$/);
     if (m) {
       const [, id, action] = m;
       const run = store.load(id);
@@ -607,6 +608,25 @@ const server = http.createServer(async (req, res) => {
       if (action === "artifact" && req.method === "GET") {
         const rel = url.searchParams.get("path") ?? "";
         return json(res, 200, { path: rel, content: store.readArtifact(run, rel) });
+      }
+
+      if (action === "diff" && req.method === "GET") {
+        const baseId = url.searchParams.get("base") || run.baseId;
+        if (!baseId) return json(res, 400, { error: "У этой версии нет базовой — сравнивать не с чем" });
+        let base;
+        try {
+          base = store.load(baseId);
+        } catch {
+          return json(res, 404, { error: "Базовая версия не найдена" });
+        }
+        const before = engine.workspaceFiles(base).reduce((acc, f) => ({ ...acc, [f.path]: f.content }), {});
+        const after = engine.workspaceFiles(run).reduce((acc, f) => ({ ...acc, [f.path]: f.content }), {});
+        const result = diffWorkspaces(before, after);
+        return json(res, 200, {
+          base: { id: base.id, createdAt: base.createdAt, change: base.change ?? null, planTitle: base.plan?.title ?? null },
+          current: { id: run.id, createdAt: run.createdAt, change: run.change ?? null, planTitle: run.plan?.title ?? null },
+          ...result,
+        });
       }
     }
 

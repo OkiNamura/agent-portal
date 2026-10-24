@@ -36,6 +36,7 @@
         <button data-tab="flow" class="active">Ход</button>
         <button data-tab="mockup">Макет</button>
         <button data-tab="files">Файлы</button>
+        <button data-tab="diff">Изменения</button>
         <span class="spacer"></span>
         <button id="stopRun" class="mini danger hidden">■ Остановить</button>
         <span id="runStatus" class="runStatus"></span>
@@ -88,6 +89,21 @@
           <div class="viewer">
             <div class="viewerHead"><span id="viewerTitle" class="dim">выбери файл</span><span class="spacer"></span><button id="rawToggle" class="mini hidden">raw</button></div>
             <div id="viewerBody" class="viewerBody"></div>
+          </div>
+        </div>
+
+        <div id="tabDiff" class="tabPane hidden filesPane">
+          <div class="diffSide">
+            <div id="diffSummary" class="diffSummary"></div>
+            <div id="diffList" class="artifacts"></div>
+          </div>
+          <div class="viewer">
+            <div class="viewerHead">
+              <span id="diffTitle" class="dim">выбери файл</span>
+              <span class="spacer"></span>
+              <label class="chk"><input type="checkbox" id="onlyChanges" checked /> только изменения</label>
+            </div>
+            <div id="diffBody" class="viewerBody diffBody"></div>
           </div>
         </div>
       </div>

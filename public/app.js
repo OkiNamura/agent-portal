@@ -29,6 +29,7 @@ const S = {
   models: [],
   modelsTried: false,
   logCutoff: 0,
+  diff: { runId: null, data: null, file: null },
   tab: "flow",
   view: "mockup",
 };
@@ -617,6 +618,7 @@ function applyRun(run) {
     }
   }
   if (S.tab === "mockup") renderPreview(run);
+  if (S.tab === "diff" && S.diff.runId !== run.id) loadDiff(run);
   const idx = S.runs.findIndex((r) => r.id === run.id);
   if (idx >= 0) {
     S.runs[idx] = { ...S.runs[idx], status: run.status, cost: run.usage.cost, change: run.change };
@@ -1032,14 +1034,16 @@ function beginRun(run) {
 
 function setTab(tab) {
   S.tab = tab;
-  document.querySelectorAll("#tabs button").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
+  document.querySelectorAll("#tabs button[data-tab]").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
   $("#tabFlow").classList.toggle("hidden", tab !== "flow");
   $("#tabMockup").classList.toggle("hidden", tab !== "mockup");
   $("#tabFiles").classList.toggle("hidden", tab !== "files");
+  $("#tabDiff").classList.toggle("hidden", tab !== "diff");
   if (tab === "mockup" && S.current) {
     S.previewSig = "";
     renderPreview(S.current);
   }
+  if (tab === "diff" && S.current) loadDiff(S.current);
 }
 
 /* ------------------------------ markdown ------------------------------ */
@@ -1097,6 +1101,109 @@ function markdown(src) {
 const inline = (s) =>
   s.replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>").replace(/(?<!\*)\*([^*]+)\*(?!\*)/g, "<i>$1</i>");
 
+/* ------------------------------ дифф версий ------------------------------ */
+
+function renderDiffSummary(d) {
+  const box = $("#diffSummary");
+  box.textContent = "";
+  const head = el("div", null, d.base.id.slice(-4) + " → " + d.current.id.slice(-4));
+  const stats = el("div");
+  stats.innerHTML = `файлов: <b>${d.summary.files}</b> · <span class="plus">+${d.summary.added}</span> · <span class="minus">−${d.summary.removed}</span>`;
+  box.append(head, stats);
+  if (d.current.change) box.append(el("div", "dim", "изменение: " + d.current.change.slice(0, 90)));
+}
+
+function renderDiffList(d) {
+  const box = $("#diffList");
+  box.textContent = "";
+  if (!d.files.length) {
+    box.append(el("div", "empty", "изменений нет"));
+    return;
+  }
+  for (const f of d.files) {
+    const item = el("div", "art" + (S.diff.file === f.path ? " active" : ""));
+    item.append(el("span", null, f.path));
+    item.append(el("span", "plus", "+" + f.added), el("span", "minus", "−" + f.removed));
+    item.addEventListener("click", () => selectDiffFile(f.path));
+    box.append(item);
+  }
+}
+
+function selectDiffFile(path) {
+  S.diff.file = path;
+  renderDiffList(S.diff.data);
+  const file = S.diff.data.files.find((f) => f.path === path);
+  $("#diffTitle").textContent = `${path} · ${file.status}`;
+  renderDiffHunks(file);
+}
+
+function renderDiffHunks(file) {
+  const box = $("#diffBody");
+  box.textContent = "";
+  const only = $("#onlyChanges").checked;
+  let oldNo = 1;
+  let newNo = 1;
+  let gap = 0;
+
+  const flushGap = () => {
+    if (gap > 0) box.append(el("div", "dl meta", `… ${gap} строк без изменений …`));
+    gap = 0;
+  };
+
+  for (const h of file.hunks) {
+    if (h.type === "ctx") {
+      if (only) {
+        gap++;
+        oldNo++;
+        newNo++;
+        continue;
+      }
+      flushGap();
+      box.append(diffLine("ctx", oldNo++, h.text, newNo++));
+      continue;
+    }
+    flushGap();
+    if (h.type === "add") box.append(diffLine("add", "", h.text, newNo++));
+    else if (h.type === "del") box.append(diffLine("del", oldNo++, h.text, ""));
+    else box.append(el("div", "dl meta", h.text));
+  }
+  if (only && gap > 0) flushGap();
+}
+
+function diffLine(kind, ln, text, newLn) {
+  const row = el("div", "dl " + kind);
+  row.append(el("span", "sign", kind === "add" ? "+" : kind === "del" ? "−" : " "));
+  row.append(el("span", "ln", String(ln || "")));
+  row.append(el("span", "txt", text));
+  void newLn;
+  return row;
+}
+
+async function loadDiff(run) {
+  const box = $("#diffList");
+  $("#diffSummary").textContent = "считаю…";
+  box.textContent = "";
+  $("#diffBody").textContent = "";
+  $("#diffTitle").textContent = "—";
+  try {
+    const d = await api(`/api/runs/${run.id}/diff`);
+    S.diff = { runId: run.id, data: d, file: null };
+    renderDiffSummary(d);
+    renderDiffList(d);
+    if (d.files[0]) selectDiffFile(d.files[0].path);
+    else {
+      $("#diffSummary").textContent = "";
+      $("#diffTitle").textContent = "изменений нет";
+    }
+  } catch (err) {
+    S.diff = { runId: run.id, data: null, file: null };
+    $("#diffSummary").textContent = "";
+    $("#diffTitle").textContent = "сравнивать не с чем";
+    $("#diffBody").textContent = err.message;
+    box.append(el("div", "empty", "это первая версия проекта"));
+  }
+}
+
 /* ------------------------------ wiring ------------------------------ */
 
 document.querySelectorAll("#nav button").forEach((b) => b.addEventListener("click", () => setPage(b.dataset.page)));
@@ -1119,8 +1226,12 @@ $("#reloadPreview").addEventListener("click", () => {
     renderPreview(S.current);
   }
 });
-document.querySelectorAll("#tabs button").forEach((b) => b.addEventListener("click", () => setTab(b.dataset.tab)));
+document.querySelectorAll("#tabs button[data-tab]").forEach((b) => b.addEventListener("click", () => setTab(b.dataset.tab)));
 document.querySelectorAll(".seg button").forEach((b) => b.addEventListener("click", () => setView(b.dataset.view)));
+$("#onlyChanges").addEventListener("change", () => {
+  const file = S.diff.data?.files.find((f) => f.path === S.diff.file);
+  if (file) renderDiffHunks(file);
+});
 $("#stopRun").addEventListener("click", async () => {
   if (!S.current) return;
   if (!confirm("Остановить прогон? Текущий вызов модели доиграет, дальше стадии не пойдут.")) return;

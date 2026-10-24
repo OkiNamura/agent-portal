@@ -236,6 +236,25 @@ textarea:focus, input:focus { border-color: #3c4a66; box-shadow: 0 0 0 3px rgba(
 .agentEditor .actions { display: flex; gap: 8px; justify-content: flex-end; }
 .tag { font-size: 9.5px; padding: 1px 6px; border-radius: 999px; border: 1px solid #3a2f55; color: #b9a7ff; background: #191428; letter-spacing: .04em; }
 
+/* дифф версий */
+.diffSide { width: 250px; flex: 0 0 auto; display: flex; flex-direction: column; gap: 8px; overflow: hidden; }
+.diffSummary { font-family: var(--mono); font-size: 11px; color: var(--dim); padding: 6px 8px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel); }
+.diffSummary b { color: var(--text); }
+.diffSummary .plus { color: var(--ok); }
+.diffSummary .minus { color: var(--bad); }
+.diffBody { font-family: var(--mono); font-size: 11.5px; line-height: 1.55; }
+.diffBody .dl { display: flex; gap: 10px; white-space: pre-wrap; word-break: break-word; padding: 0 4px; }
+.diffBody .dl .sign { flex: 0 0 10px; color: #46536a; user-select: none; }
+.diffBody .dl .ln { flex: 0 0 34px; text-align: right; color: #46536a; user-select: none; }
+.diffBody .dl.add { background: #0f2419; color: #b7ecc9; }
+.diffBody .dl.del { background: #2a1114; color: #f3b6b6; }
+.diffBody .dl.ctx { color: #93a3ba; }
+.diffBody .dl.meta { color: #5f6f85; font-style: italic; }
+.chk { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--dim); cursor: pointer; }
+.chk input { width: auto; margin: 0; }
+.art .plus { color: var(--ok); font-size: 10px; }
+.art .minus { color: var(--bad); font-size: 10px; }
+
 /* статистика */
 .statsBody { padding: 6px 18px 24px; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; }
 .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
