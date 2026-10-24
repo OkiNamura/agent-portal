@@ -30,6 +30,7 @@ const S = {
   modelsTried: false,
   logCutoff: 0,
   metrics: null,
+  studio: { items: [], models: [], refItem: null, refData: null },
   corner: { items: [], unread: 0, alerts: [] },
   diff: { runId: null, data: null, file: null },
   tab: "flow",
@@ -88,9 +89,11 @@ function setPage(page) {
   $("#pageProjects").classList.toggle("hidden", page !== "projects");
   $("#pageAgents").classList.toggle("hidden", page !== "agents");
   $("#pageStats").classList.toggle("hidden", page !== "stats");
+  $("#pageStudio").classList.toggle("hidden", page !== "studio");
   $("#pageAssistant").classList.toggle("hidden", page !== "assistant");
   renderList();
   if (page === "stats") loadStats();
+  if (page === "studio") loadStudio();
   if (page === "assistant") {
     renderChat();
     setTimeout(() => $("#askInput")?.focus(), 50);
@@ -172,6 +175,141 @@ function renderList() {
     item.append(txt);
     item.addEventListener("click", () => document.querySelector(anchor)?.scrollIntoView({ behavior: "smooth" }));
     box.append(item);
+  }
+}
+
+/* ------------------------------ картинки ------------------------------ */
+
+async function loadStudio() {
+  if (!S.studio.models.length) {
+    try {
+      const { models } = await api("/api/images/models");
+      S.studio.models = models ?? [];
+      const sel = $("#imgModel");
+      sel.textContent = "";
+      for (const m of S.studio.models) {
+        const opt = document.createElement("option");
+        opt.value = m.id;
+        opt.textContent = m.name;
+        sel.append(opt);
+      }
+      const preferred = ["google/gemini-3.1-flash-image", "black-forest-labs/flux-3-image-klein", "bytedance-seed/seedream-5-0-flash"];
+      const pick = preferred.find((id) => S.studio.models.some((m) => m.id === id)) ?? S.studio.models[0]?.id;
+      if (pick) sel.value = pick;
+    } catch {
+      /* без списка моделей */
+    }
+  }
+  try {
+    const { items } = await api("/api/images?limit=40");
+    S.studio.items = items ?? [];
+    renderStudio();
+  } catch (err) {
+    $("#studioInfo").textContent = err.message;
+  }
+}
+
+function renderStudio() {
+  const box = $("#studioFeed");
+  box.textContent = "";
+  if (!S.studio.items.length) {
+    box.append(el("div", "empty", "Пока ничего не нарисовано. Напиши запрос внизу — например «обложка для калькулятора, минимализм, тёмная тема»."));
+    return;
+  }
+  const total = S.studio.items.reduce((sum, i) => sum + (i.cost || 0), 0);
+  $("#studioInfo").textContent = `картинок: ${S.studio.items.length} · потрачено $${total.toFixed(3)}`;
+
+  for (const item of S.studio.items) {
+    const card = el("div", "shot");
+    const img = document.createElement("img");
+    img.src = `/studio/${item.file}?v=${item.id}`;
+    img.loading = "lazy";
+    img.alt = item.prompt.slice(0, 60);
+    card.append(img);
+    card.append(el("div", "prompt", item.prompt));
+
+    const meta = el("div", "meta");
+    meta.append(
+      el("span", null, item.model),
+      el("span", null, `${(item.size / 1024).toFixed(0)} КБ`),
+      el("span", null, `$${(item.cost || 0).toFixed(3)}`),
+      el("span", null, `${(item.ms / 1000).toFixed(1)} с`),
+      el("span", null, new Date(item.at).toLocaleString("ru-RU"))
+    );
+    card.append(meta);
+
+    const acts = el("div", "acts");
+    const again = el("button", "mini", "переделать");
+    again.addEventListener("click", () => {
+      S.studio.refItem = item;
+      S.studio.refData = null;
+      renderChip();
+      $("#imgPrompt").value = item.prompt;
+      $("#imgPrompt").focus();
+    });
+    const dl = el("a", "mini link", "скачать");
+    dl.href = `/studio/${item.file}`;
+    dl.download = item.file;
+    acts.append(again, dl);
+    card.append(acts);
+
+    box.append(card);
+  }
+}
+
+function renderChip() {
+  const chip = $("#imgChip");
+  const src = S.studio.refData ?? (S.studio.refItem ? `/studio/${S.studio.refItem.file}` : null);
+  if (!src) {
+    chip.classList.add("hidden");
+    chip.textContent = "";
+    return;
+  }
+  chip.classList.remove("hidden");
+  chip.textContent = "";
+  const img = document.createElement("img");
+  img.src = src;
+  const kill = el("button", null, "✕");
+  kill.addEventListener("click", (e) => {
+    e.preventDefault();
+    S.studio.refData = null;
+    S.studio.refItem = null;
+    renderChip();
+  });
+  chip.append(img, kill);
+}
+
+async function sendImage() {
+  const prompt = $("#imgPrompt").value.trim();
+  if (prompt.length < 2) {
+    $("#imgPrompt").focus();
+    return;
+  }
+  const btn = $("#imgSend");
+  btn.disabled = true;
+  $("#studioInfo").innerHTML = '<span class="spin"></span> рисую…';
+  const body = {
+    prompt,
+    model: $("#imgModel").value,
+    aspectRatio: $("#imgAspect").value,
+    quality: $("#imgQuality").value,
+  };
+  if (S.studio.refItem && !S.studio.refData) body.referenceId = S.studio.refItem.id;
+  if (S.studio.refData) body.reference = S.studio.refData;
+
+  try {
+    const { item } = await api("/api/images", { method: "POST", body: JSON.stringify(body) });
+    S.studio.items.unshift(item);
+    S.studio.refItem = null;
+    S.studio.refData = null;
+    $("#imgPrompt").value = "";
+    renderChip();
+    renderStudio();
+  } catch (err) {
+    $("#studioInfo").textContent = err.message;
+    pushLog({ at: new Date().toISOString(), kind: "error", message: err.message });
+  } finally {
+    btn.disabled = false;
   }
 }
 
@@ -1463,8 +1601,27 @@ $("#askInput").addEventListener("keydown", (e) => {
   if (e.key === "Enter") ask();
 });
 
-$("#cornerBtn").addEventListener("click", async () => {
-  const panel = $("#cornerPanel");
+$("#imgSend").addEventListener("click", sendImage);
+$("#imgPrompt").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    sendImage();
+  }
+});
+$("#imgFile").addEventListener("change", (e) => {
+  const file = e.target.files?.[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    S.studio.refData = String(reader.result);
+    S.studio.refItem = null;
+    renderChip();
+  };
+  reader.readAsDataURL(file);
+  e.target.value = "";
+});
+
+$("#cornerBtn").addEventListener("click", async () => {  const panel = $("#cornerPanel");
   panel.classList.toggle("hidden");
   if (!panel.classList.contains("hidden")) {
     renderCorner();

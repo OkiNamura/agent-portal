@@ -264,6 +264,27 @@ textarea:focus, input:focus { border-color: #3c4a66; box-shadow: 0 0 0 3px rgba(
 table.tbl { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 table.tbl th { text-align: left; color: var(--dim); font-weight: 600; font-size: 11px; letter-spacing: .08em; text-transform: uppercase; padding: 6px 8px; border-bottom: 1px solid var(--line); }
 table.tbl td { padding: 7px 8px; border-bottom: 1px solid #171e28; font-family: var(--mono); font-size: 11.5px; }
+/* картинки */
+.studio { flex: 1; display: flex; flex-direction: column; overflow: hidden; padding: 0 18px 14px; gap: 10px; }
+.studioBar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.miniSelect { width: auto; max-width: 320px; padding: 6px 10px; font-size: 12px; background: #0a0d12; color: var(--text); border: 1px solid var(--line); border-radius: 8px; }
+.studioFeed { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 16px; padding: 6px 0; }
+.shot { display: flex; flex-direction: column; gap: 8px; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); padding: 12px; }
+.shot img { max-width: 100%; max-height: 520px; border-radius: 10px; background: #0a0d12; object-fit: contain; align-self: flex-start; }
+.shot .meta { display: flex; gap: 12px; flex-wrap: wrap; font-family: var(--mono); font-size: 10.5px; color: #5f6f85; }
+.shot .prompt { font-size: 12.5px; color: #c3cfdf; }
+.shot .acts { display: flex; gap: 8px; }
+.studioInput { display: flex; gap: 10px; align-items: flex-end; border-top: 1px solid var(--line); padding-top: 10px; }
+.studioInput textarea { flex: 1; min-height: 46px; }
+.attach { display: grid; place-items: center; width: 40px; height: 40px; border: 1px solid var(--line); border-radius: 10px; cursor: pointer; font-size: 16px; }
+.attach:hover { border-color: #33415a; }
+.chip { position: relative; width: 54px; height: 54px; border: 1px solid #2c3750; border-radius: 10px; overflow: hidden; }
+.chip img { width: 100%; height: 100%; object-fit: cover; }
+.chip button { position: absolute; top: 1px; right: 1px; padding: 0 4px; font-size: 10px; background: rgba(0,0,0,.6); border: 0; color: #fff; }
+.chip.hidden { display: none; }
+.spin { display: inline-block; width: 12px; height: 12px; border: 2px solid #3a4a63; border-top-color: var(--accent); border-radius: 50%; animation: sp 0.8s linear infinite; }
+@keyframes sp { to { transform: rotate(360deg); } }
+
 table.tbl td.name { font-family: inherit; font-size: 12.5px; }
 .bar { height: 6px; border-radius: 3px; background: var(--accent); min-width: 2px; }
 .barWrap { width: 100%; max-width: 220px; background: #171e28; border-radius: 3px; }

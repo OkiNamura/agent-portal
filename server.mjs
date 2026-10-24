@@ -14,6 +14,7 @@ import { diffWorkspaces } from "./lib/diff.mjs";
 import { agentMetrics, verdictSummary } from "./lib/metrics.mjs";
 import { Mailbox } from "./lib/mailbox.mjs";
 import { collectAlerts } from "./lib/watch.mjs";
+import { Studio, generateImage, listImageModels } from "./lib/studio.mjs";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 loadEnv(ROOT);
@@ -51,6 +52,7 @@ bus.setMaxListeners(200);
 const engine = new Engine({ store, config, bus });
 
 const mailbox = new Mailbox(ROOT);
+const studio = new Studio(ROOT);
 let harness = readJson(path.join(CONFIG_DIR, "harness.json"));
 
 /* ---------- что будит Харнесса: события портала → почтовый ящик ---------- */
@@ -110,13 +112,13 @@ const json = (res, code, payload) => {
   res.end(body);
 };
 
-const readBody = (req) =>
+const readBody = (req, limit = 2_000_000) =>
   new Promise((resolve, reject) => {
     let size = 0;
     const chunks = [];
     req.on("data", (c) => {
       size += c.length;
-      if (size > 2_000_000) {
+      if (size > limit) {
         reject(new Error("Тело запроса слишком большое"));
         req.destroy();
         return;
@@ -355,6 +357,12 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
+    if (pathname.startsWith("/studio/")) {
+      const file = pathname.slice("/studio/".length);
+      const item = studio.items.find((i) => i.file === file);
+      if (!item) return json(res, 404, { error: "not found" });
+      return serveFile(res, studio.filePath(item), 3600);
+    }
     if (pathname.startsWith("/preview/")) return servePreview(res, pathname);
     if (!pathname.startsWith("/api/")) return serveStatic(req, res, pathname);
 
@@ -628,7 +636,6 @@ const server = http.createServer(async (req, res) => {
     if (pathname === "/api/harness" && req.method === "GET") {
       return json(res, 200, { harness });
     }
-
     if (pathname === "/api/harness" && req.method === "POST") {
       const body = await readBody(req);
       harness = {
@@ -639,6 +646,63 @@ const server = http.createServer(async (req, res) => {
       };
       fs.writeFileSync(path.join(CONFIG_DIR, "harness.json"), JSON.stringify(harness, null, 2), "utf8");
       return json(res, 200, { harness });
+    }
+
+    if (pathname === "/api/images/models" && req.method === "GET") {
+      try {
+        return json(res, 200, { models: await imageModels() });
+      } catch (err) {
+        return json(res, 200, { models: [], error: err.message });
+      }
+    }
+
+    if (pathname === "/api/images" && req.method === "GET") {
+      const limit = Math.min(Number(url.searchParams.get("limit") ?? 60), 200);
+      return json(res, 200, { items: studio.list(limit) });
+    }
+
+    if (pathname === "/api/images" && req.method === "POST") {
+      const body = await readBody(req, 14_000_000);
+      const prompt = String(body.prompt ?? "").trim();
+      if (prompt.length < 2) return json(res, 400, { error: "Пустой промт" });
+      if (isMock()) return json(res, 502, { error: "MOCK-режим: картинки не генерируются без ключа" });
+
+      const model = String(body.model ?? "google/gemini-3.1-flash-image");
+      const references = [];
+      let refId = null;
+      if (body.referenceId) {
+        const item = studio.get(String(body.referenceId));
+        if (!item) return json(res, 404, { error: "Референс не найден" });
+        references.push(studio.dataUrl(item));
+        refId = item.id;
+      } else if (typeof body.reference === "string" && body.reference.startsWith("data:image/")) {
+        references.push(body.reference);
+      }
+
+      try {
+        const out = await generateImage({
+          model,
+          prompt,
+          aspectRatio: body.aspectRatio ? String(body.aspectRatio) : undefined,
+          quality: body.quality ? String(body.quality) : undefined,
+          resolution: body.resolution ? String(body.resolution) : undefined,
+          references,
+        });
+        const item = studio.add({
+          prompt,
+          model,
+          aspectRatio: body.aspectRatio ?? null,
+          quality: body.quality ?? null,
+          mediaType: out.mediaType,
+          b64: out.b64,
+          cost: out.cost,
+          ms: out.ms,
+          refId,
+        });
+        return json(res, 200, { item, url: `/studio/${item.file}` });
+      } catch (err) {
+        return json(res, 502, { error: String(err?.message || err) });
+      }
     }
 
     if (pathname === "/api/assistant" && req.method === "POST") {
@@ -828,6 +892,15 @@ async function getModels() {
   if (fresh && modelsCache.models.length) return modelsCache.models;
   const models = await listModels();
   modelsCache = { at: Date.now(), models };
+  return models;
+}
+
+let imgModelsCache = { at: 0, models: [] };
+async function imageModels() {
+  const fresh = Date.now() - imgModelsCache.at < 3600_000;
+  if (fresh && imgModelsCache.models.length) return imgModelsCache.models;
+  const models = await listImageModels();
+  imgModelsCache = { at: Date.now(), models };
   return models;
 }
 

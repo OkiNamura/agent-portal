@@ -5,6 +5,7 @@
 runs/
 projects.json
 mailbox.json
+studio/
 output/
 
 # локальные инструменты (портативный git)

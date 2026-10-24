@@ -20,6 +20,7 @@
   <nav class="nav" id="nav">
     <button data-page="projects" class="active"><span class="ico">▣</span><span>Проекты</span></button>
     <button data-page="agents"><span class="ico">◈</span><span>Агенты</span></button>
+    <button data-page="studio"><span class="ico">✷</span><span>Картинки</span></button>
     <button data-page="stats"><span class="ico">▤</span><span>Статистика</span></button>
     <button data-page="assistant"><span class="ico">✎</span><span>Ассистент</span></button>
   </nav>
@@ -118,9 +119,46 @@
       <div id="agentEditor" class="agentEditor"></div>
     </div>
 
-    <!-- СТАТИСТИКА -->
-    <div id="pageStats" class="page hidden">
+    <!-- КАРТИНКИ -->
+    <div id="pageStudio" class="page hidden">
       <div class="pageHead">
+        <h1>Картинки</h1>
+        <div class="dim">Запрос → картинка. Следующий запрос может быть правкой: прикрепи свою картинку или нажми «переделать» на результате.</div>
+      </div>
+      <div class="studio">
+        <div class="studioBar">
+          <select id="imgModel" class="miniSelect"></select>
+          <select id="imgAspect" class="miniSelect">
+            <option value="1:1">1:1</option>
+            <option value="16:9">16:9</option>
+            <option value="9:16">9:16</option>
+            <option value="4:3">4:3</option>
+            <option value="3:4">3:4</option>
+            <option value="3:2">3:2</option>
+          </select>
+          <select id="imgQuality" class="miniSelect">
+            <option value="auto">auto</option>
+            <option value="low">low</option>
+            <option value="medium">medium</option>
+            <option value="high">high</option>
+          </select>
+          <span class="spacer"></span>
+          <span id="studioInfo" class="dim"></span>
+        </div>
+        <div id="studioFeed" class="studioFeed"></div>
+        <div class="studioInput">
+          <label class="attach" title="Прикрепить картинку-референс">
+            📎<input type="file" id="imgFile" accept="image/*" hidden />
+          </label>
+          <div id="imgChip" class="chip hidden"></div>
+          <textarea id="imgPrompt" rows="2" placeholder="Что нарисовать? Или что поправить в прикреплённой картинке?"></textarea>
+          <button id="imgSend" class="primary">Создать</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- СТАТИСТИКА -->
+    <div id="pageStats" class="page hidden">      <div class="pageHead">
         <h1>Статистика</h1>
         <div class="dim">Считается по всем прогонам: расход, модели, проекты, дни.</div>
       </div>
