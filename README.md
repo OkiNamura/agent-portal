@@ -138,10 +138,20 @@ node scripts/probe.mjs
 
 ## Git
 
+Репозиторий: **git@github.com:OkiNamura/agent-portal.git** (ветка `main`).
+
+В `.gitignore` уходят секреты и данные: `.env`, `config/keys.json`, `runs/`, `studio/`, `output/`, `projects.json`, `mailbox.json`, `.tools/`.
+
+Перед коммитом полезно прогнать проверку на секреты:
+
 ```bat
-git init
-git add .
-git commit -m "agent portal v1"
+node scripts/check-secrets.mjs
 ```
 
-`.env` и `runs/` в `.gitignore`. Артефакты прогонов — это данные, их не обязательно хранить в репозитории.
+Он ищет ключи OpenRouter/OpenAI/Anthropic/Telegram в файлах и возвращает ошибку, если что-то нашёл. Дополнительно GitHub сам блокирует пуш с секретом (push protection) — так и был пойман случай с `config/keys.json`.
+
+Пуш:
+
+```bat
+.\.tools\git\cmd\git.exe push
+```
