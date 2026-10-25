@@ -90,10 +90,12 @@ function setPage(page) {
   $("#pageAgents").classList.toggle("hidden", page !== "agents");
   $("#pageStats").classList.toggle("hidden", page !== "stats");
   $("#pageStudio").classList.toggle("hidden", page !== "studio");
+  $("#pageKeys").classList.toggle("hidden", page !== "keys");
   $("#pageAssistant").classList.toggle("hidden", page !== "assistant");
   renderList();
   if (page === "stats") loadStats();
   if (page === "studio") loadStudio();
+  if (page === "keys") loadKeys();
   if (page === "assistant") {
     renderChat();
     setAssistTab("chat");
@@ -240,6 +242,16 @@ async function loadStudio() {
       const preferred = ["google/gemini-3.1-flash-image", "black-forest-labs/flux-3-image-klein", "bytedance-seed/seedream-5-0-flash"];
       const pick = preferred.find((id) => S.studio.models.some((m) => m.id === id)) ?? S.studio.models[0]?.id;
       if (pick) sel.value = pick;
+      try {
+        const { image } = await api("/api/prices");
+        S.studio.prices = image ?? {};
+        for (const opt of sel.options) {
+          const p = S.studio.prices[opt.value];
+          if (p) opt.textContent = `${opt.textContent} · ~$${p.toFixed(2)}`;
+        }
+      } catch {
+        /* без цен */
+      }
     } catch {
       /* без списка моделей */
     }
@@ -465,6 +477,16 @@ function proposalCard(msg) {
   aspect.value = msg.aspectRatio ?? "1:1";
   row.append(model, aspect);
 
+  // цена выбранной модели — обновляется при смене
+  const est = el("span", "dim");
+  const updateEst = () => {
+    const p = S.studio.prices?.[model.value];
+    est.textContent = p ? `≈ $${p.toFixed(2)}` : "цена неизвестна";
+  };
+  model.addEventListener("change", updateEst);
+  row.append(est);
+  setTimeout(updateEst, 0);
+
   const refId = msg.ref ?? lastResultId();
   let refBox = null;
   if (refId) {
@@ -659,6 +681,155 @@ async function anotherProposal(msg) {
   } catch (err) {
     $("#studioInfo").textContent = err.message;
   }
+}
+
+/* -------------------------------- ключи -------------------------------- */
+
+async function loadKeys() {
+  const box = $("#keysBody");
+  box.textContent = "…";
+  let data;
+  try {
+    data = await api("/api/keys");
+  } catch (err) {
+    box.textContent = "Ошибка: " + err.message;
+    return;
+  }
+  box.textContent = "";
+
+  // пресеты
+  box.append(el("div", "sectionTitle", "Быстрая настройка моделей"));
+  const presets = el("div", "presetRow");
+  for (const [key, meta] of Object.entries(data.presets ?? {})) {
+    const b = el("button", "presetBtn");
+    b.append(el("b", null, meta.title), el("span", null, meta.note));
+    b.addEventListener("click", async () => {
+      b.disabled = true;
+      try {
+        const res = await api("/api/keys/preset", { method: "POST", body: JSON.stringify({ preset: key }) });
+        S.agents = res.agents.agents;
+        S.agentsFile = res.agents;
+        await loadKeys();
+      } catch (err) {
+        alert(err.message);
+      } finally {
+        b.disabled = false;
+      }
+    });
+    presets.append(b);
+  }
+  box.append(presets);
+
+  // список ключей
+  box.append(el("div", "sectionTitle", "Ключи OpenRouter"));
+  const list = el("div", "keysList");
+  for (const k of data.keys ?? []) {
+    const card = el("div", "keyCard");
+    const head = el("div", "keyHead");
+    head.append(el("b", null, k.label), el("span", "dim", k.mask));
+    if (data.defaultKeyId === k.id) head.append(el("span", "tag", "по умолчанию"));
+
+    const limit = document.createElement("input");
+    limit.type = "number";
+    limit.min = "0";
+    limit.step = "0.5";
+    limit.className = "limitInput";
+    limit.value = String(k.limitDaily ?? 0);
+    limit.title = "Дневной лимит, $ (0 — без лимита)";
+    limit.addEventListener("change", async () => {
+      await api(`/api/keys/${k.id}`, { method: "POST", body: JSON.stringify({ limitDaily: Number(limit.value) }) });
+      await loadKeys();
+    });
+
+    const spend = el("div", "meta");
+    spend.append(el("span", null, `сегодня: $${(data.spend?.[k.id] ?? 0).toFixed(3)}`), el("span", null, "лимит: $"), limit);
+    if (k.limitDaily) spend.append(el("span", null, `из $${k.limitDaily}`));
+
+    const acts = el("div", "keyActs");
+    if (data.defaultKeyId !== k.id) {
+      const def = el("button", "mini", "сделать основным");
+      def.addEventListener("click", async () => {
+        await api("/api/keys/default", { method: "POST", body: JSON.stringify({ id: k.id }) });
+        await loadKeys();
+      });
+      acts.append(def);
+    }
+    const del = el("button", "mini danger", "удалить");
+    del.addEventListener("click", async () => {
+      if (!confirm(`Удалить ключ «${k.label}»?`)) return;
+      try {
+        await api(`/api/keys/${k.id}`, { method: "DELETE" });
+        await loadKeys();
+      } catch (err) {
+        alert(err.message);
+      }
+    });
+    acts.append(del);
+
+    card.append(head, spend, acts);
+    list.append(card);
+  }
+  box.append(list);
+
+  // добавление
+  box.append(el("div", "sectionTitle", "Добавить ключ"));
+  const form = el("div", "keyForm");
+  const label = document.createElement("input");
+  label.placeholder = "Название, например «Основной»";
+  const key = document.createElement("input");
+  key.placeholder = "sk-or-v1-…";
+  key.type = "password";
+  const add = el("button", "primary", "Добавить");
+  add.addEventListener("click", async () => {
+    add.disabled = true;
+    try {
+      await api("/api/keys", { method: "POST", body: JSON.stringify({ label: label.value || "Ключ", key: key.value, limitDaily: 0 }) });
+      label.value = "";
+      key.value = "";
+      await loadKeys();
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      add.disabled = false;
+    }
+  });
+  form.append(label, key, add);
+  box.append(form);
+  box.append(el("div", "hint", "Ключ хранится в config/keys.json на этой машине и наружу отдаётся только маской."));
+
+  // привязка агентов
+  box.append(el("div", "sectionTitle", "Какой ключ у какого агента"));
+  const table = el("table", "tbl");
+  table.innerHTML = "<thead><tr><th>Агент</th><th>Модель</th><th>Ключ</th></tr></thead>";
+  const tb = document.createElement("tbody");
+  for (const a of S.agents) {
+    if (a.kind === "external") continue;
+    const tr = document.createElement("tr");
+    tr.append(td(a.name, "name"), td(a.model || "—"));
+    const cell = document.createElement("td");
+    const sel = document.createElement("select");
+    sel.className = "miniSelect";
+    const auto = document.createElement("option");
+    auto.value = "";
+    auto.textContent = "по умолчанию";
+    sel.append(auto);
+    for (const k of data.keys ?? []) {
+      const o = document.createElement("option");
+      o.value = k.id;
+      o.textContent = k.label;
+      sel.append(o);
+    }
+    sel.value = data.assign?.[a.id] ?? "";
+    sel.addEventListener("change", async () => {
+      await api("/api/keys/assign", { method: "POST", body: JSON.stringify({ agentId: a.id, keyId: sel.value || null }) });
+      await loadKeys();
+    });
+    cell.append(sel);
+    tr.append(cell);
+    tb.append(tr);
+  }
+  table.append(tb);
+  box.append(table);
 }
 
 /* ------------------------------ ассистент ------------------------------ */

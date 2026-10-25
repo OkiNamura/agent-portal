@@ -298,6 +298,21 @@ table.tbl td { padding: 7px 8px; border-bottom: 1px solid #171e28; font-family: 
 .shot .meta { display: flex; gap: 12px; flex-wrap: wrap; font-family: var(--mono); font-size: 10.5px; color: #5f6f85; }
 .shot .prompt { font-size: 12.5px; color: #c3cfdf; }
 .shot .acts { display: flex; gap: 8px; }
+/* ключи и лимиты */
+.keysBody { padding: 6px 18px 24px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; }
+.presetRow { display: flex; gap: 10px; flex-wrap: wrap; }
+.presetBtn { display: flex; flex-direction: column; gap: 2px; align-items: flex-start; padding: 10px 14px; min-width: 170px; }
+.presetBtn b { font-size: 13px; }
+.presetBtn span { font-size: 11px; color: var(--dim); }
+.keysList { display: flex; flex-direction: column; gap: 8px; }
+.keyCard { border: 1px solid var(--line); border-radius: 12px; background: var(--panel); padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; }
+.keyHead { display: flex; align-items: center; gap: 10px; }
+.keyHead .tag { font-size: 10px; padding: 1px 7px; border-radius: 999px; border: 1px solid #1f4b3a; color: var(--ok); }
+.keyCard .meta { display: flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 11px; color: var(--dim); }
+.limitInput { width: 90px; padding: 4px 8px; font-size: 11px; }
+.keyActs { display: flex; gap: 8px; }
+.keyForm { display: flex; gap: 8px; flex-wrap: wrap; }
+.keyForm input { flex: 1; min-width: 180px; }
 .studioInput { display: flex; gap: 10px; align-items: flex-end; border-top: 1px solid var(--line); padding-top: 10px; }
 .studioInput textarea { flex: 1; min-height: 46px; }
 .attach { display: grid; place-items: center; width: 40px; height: 40px; border: 1px solid var(--line); border-radius: 10px; cursor: pointer; font-size: 16px; }

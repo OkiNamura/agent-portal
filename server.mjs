@@ -15,6 +15,7 @@ import { agentMetrics, verdictSummary } from "./lib/metrics.mjs";
 import { Mailbox } from "./lib/mailbox.mjs";
 import { collectAlerts } from "./lib/watch.mjs";
 import { Studio, generateImage, listImageModels } from "./lib/studio.mjs";
+import { Keys, PRESETS } from "./lib/keys.mjs";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 loadEnv(ROOT);
@@ -45,11 +46,62 @@ function readConfig() {
 }
 
 let config = readConfig();
+
+/* ориентировочные цены за картинку — для подсказок в интерфейсе */
+const IMAGE_PRICES = {
+  "google/gemini-3.1-flash-image": 0.067,
+  "google/gemini-3.1-flash-lite-image": 0.02,
+  "google/gemini-3-pro-image": 0.12,
+  "openai/gpt-image-2": 0.13,
+  "openai/gpt-image-1-mini": 0.04,
+  "black-forest-labs/flux-3-image": 0.05,
+  "black-forest-labs/flux-3-image-klein": 0.02,
+  "bytedance-seed/seedream-5-0-flash": 0.02,
+  "bytedance-seed/seedream-5-0-pro": 0.06,
+  "qwen/qwen-image-2.1-turbo": 0.01,
+  "qwen/qwen-image-3": 0.03,
+  "microsoft/mai-image-2.6": 0.04,
+};
+
+/* пресеты моделей: одна кнопка меняет модели у всех LLM-агентов */
+const PRESET_MODELS = {
+  price: {
+    orchestrator: "qwen/qwen3.7-flash",
+    architect: "qwen/qwen3.7-flash",
+    analyst: "qwen/qwen3.7-flash",
+    coder: "deepseek/deepseek-chat",
+    tester: "qwen/qwen3.7-flash",
+    critic: "google/gemini-2.5-flash-lite",
+    artist: "qwen/qwen3.7-flash",
+    assistant: "qwen/qwen3.7-flash",
+  },
+  speed: {
+    orchestrator: "google/gemini-2.5-flash-lite",
+    architect: "google/gemini-2.5-flash-lite",
+    analyst: "google/gemini-2.5-flash-lite",
+    coder: "deepseek/deepseek-v3.2",
+    tester: "google/gemini-2.5-flash-lite",
+    critic: "google/gemini-2.5-flash-lite",
+    artist: "google/gemini-2.5-flash-lite",
+    assistant: "google/gemini-2.5-flash-lite",
+  },
+  quality: {
+    orchestrator: "deepseek/deepseek-v3.2",
+    architect: "deepseek/deepseek-v3.2",
+    analyst: "deepseek/deepseek-v3.2",
+    coder: "deepseek/deepseek-v3.2",
+    tester: "deepseek/deepseek-v3.2",
+    critic: "deepseek/deepseek-v3.2",
+    artist: "deepseek/deepseek-v3.2",
+    assistant: "deepseek/deepseek-v3.2",
+  },
+};
 const store = new Store(ROOT);
 const projects = new Projects(ROOT);
 const bus = new EventEmitter();
 bus.setMaxListeners(200);
-const engine = new Engine({ store, config, bus });
+const keys = new Keys(ROOT);
+const engine = new Engine({ store, config, bus, keys });
 
 const mailbox = new Mailbox(ROOT);
 const studio = new Studio(ROOT);
@@ -636,6 +688,73 @@ const server = http.createServer(async (req, res) => {
     if (pathname === "/api/harness" && req.method === "GET") {
       return json(res, 200, { harness });
     }
+    if (pathname === "/api/keys" && req.method === "GET") {
+      return json(res, 200, { ...keys.list(), presets: PRESETS, spend: Object.fromEntries((keys.list().keys ?? []).map((k) => [k.id, engine.keySpend(k.id)])) });
+    }
+
+    if (pathname === "/api/keys" && req.method === "POST") {
+      const body = await readBody(req);
+      try {
+        return json(res, 200, keys.add({ label: body.label, key: body.key, limitDaily: body.limitDaily }));
+      } catch (err) {
+        return json(res, 400, { error: String(err.message) });
+      }
+    }
+
+    const km = pathname.match(/^\/api\/keys\/([\w-]+)$/);
+    const KEYS_RESERVED = new Set(["preset", "assign", "default"]);
+    if (km && !KEYS_RESERVED.has(km[1]) && req.method === "POST") {
+      const body = await readBody(req);
+      try {
+        return json(res, 200, keys.patch(km[1], body));
+      } catch (err) {
+        return json(res, 400, { error: String(err.message) });
+      }
+    }
+    if (km && !KEYS_RESERVED.has(km[1]) && req.method === "DELETE") {
+      try {
+        return json(res, 200, keys.remove(km[1]));
+      } catch (err) {
+        return json(res, 400, { error: String(err.message) });
+      }
+    }
+
+    if (pathname === "/api/keys/assign" && req.method === "POST") {
+      const body = await readBody(req);
+      try {
+        return json(res, 200, keys.assign(String(body.agentId ?? ""), body.keyId ?? null));
+      } catch (err) {
+        return json(res, 400, { error: String(err.message) });
+      }
+    }
+
+    if (pathname === "/api/keys/default" && req.method === "POST") {
+      const body = await readBody(req);
+      try {
+        return json(res, 200, keys.setDefault(body.id ?? null));
+      } catch (err) {
+        return json(res, 400, { error: String(err.message) });
+      }
+    }
+
+    if (pathname === "/api/keys/preset" && req.method === "POST") {
+      const body = await readBody(req);
+      const preset = String(body.preset ?? "");
+      const map = PRESET_MODELS[preset];
+      if (!map) return json(res, 400, { error: "Неизвестный пресет" });
+      const list = config.agents.agents ?? [];
+      for (const a of list) {
+        if (a.kind === "external") continue;
+        if (map[a.id]) a.model = map[a.id];
+      }
+      fs.writeFileSync(path.join(CONFIG_DIR, "agents.json"), JSON.stringify(config.agents, null, 2), "utf8");
+      return json(res, 200, { agents: config.agents, preset });
+    }
+
+    if (pathname === "/api/prices" && req.method === "GET") {
+      return json(res, 200, { image: IMAGE_PRICES, note: "оценка по данным OpenRouter, точная цена — в чеке после генерации" });
+    }
+
     if (pathname === "/api/harness" && req.method === "POST") {
       const body = await readBody(req);
       harness = {
