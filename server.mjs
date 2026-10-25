@@ -102,6 +102,7 @@ const bus = new EventEmitter();
 bus.setMaxListeners(200);
 const keys = new Keys(ROOT);
 const engine = new Engine({ store, config, bus, keys });
+engine.spendProvider = keySpendFromLogs;
 
 const mailbox = new Mailbox(ROOT);
 const studio = new Studio(ROOT);
@@ -238,6 +239,24 @@ function allRuns() {
     }
   }
   return out;
+}
+
+/** Сколько потратил конкретный ключ за сегодня — считаем по журналам, а не по памяти. */
+let keySpendCache = { at: 0, byKey: {} };
+function keySpendFromLogs(keyId) {
+  if (Date.now() - keySpendCache.at > 15_000) {
+    const day = new Date().toISOString().slice(0, 10);
+    const byKey = {};
+    for (const r of allRuns()) {
+      for (const e of r.events ?? []) {
+        if (e.kind !== "call_done" || !e.keyId) continue;
+        if (!String(e.at ?? "").startsWith(day)) continue;
+        byKey[e.keyId] = (byKey[e.keyId] ?? 0) + (e.usage?.cost ?? 0);
+      }
+    }
+    keySpendCache = { at: Date.now(), byKey };
+  }
+  return keySpendCache.byKey[keyId] ?? 0;
 }
 
 function buildStats() {
@@ -644,6 +663,50 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { stats: buildStats() });
     }
 
+    if (pathname === "/api/search" && req.method === "GET") {
+      const q = String(url.searchParams.get("q") ?? "").trim().toLowerCase();
+      if (q.length < 2) return json(res, 400, { error: "Слишком короткий запрос" });
+      const runs = allRuns();
+      const byId = new Map(runs.map((r) => [r.id, r]));
+
+      const projectsHit = projects
+        .list()
+        .filter((p) => `${p.name} ${p.task}`.toLowerCase().includes(q))
+        .slice(0, 10)
+        .map((p) => ({ id: p.id, name: p.name, task: p.task.slice(0, 120) }));
+
+      const runsHit = [];
+      for (const r of runs) {
+        const hay = `${r.id} ${r.task ?? ""} ${r.change ?? ""} ${r.plan?.title ?? ""}`.toLowerCase();
+        if (hay.includes(q)) runsHit.push({ id: r.id, projectId: r.projectId, status: r.status, task: (r.plan?.title ?? r.task ?? "").slice(0, 120), change: r.change ?? null });
+        if (runsHit.length >= 10) break;
+      }
+
+      const artifactsHit = [];
+      for (const r of runs) {
+        for (const a of r.artifacts ?? []) {
+          if (a.path.toLowerCase().includes(q)) {
+            artifactsHit.push({ runId: r.id, projectId: r.projectId, path: a.path });
+            if (artifactsHit.length >= 15) break;
+          }
+        }
+        if (artifactsHit.length >= 15) break;
+      }
+
+      const imagesHit = studio
+        .list(300)
+        .filter((i) => (i.prompt ?? "").toLowerCase().includes(q))
+        .slice(0, 12)
+        .map((i) => ({ id: i.id, file: i.file, prompt: i.prompt.slice(0, 140), cost: i.cost }));
+
+      const agentsHit = (config.agents.agents ?? [])
+        .filter((a) => `${a.name} ${a.role} ${a.id}`.toLowerCase().includes(q))
+        .map((a) => ({ id: a.id, name: a.name, role: a.role }));
+
+      void byId;
+      return json(res, 200, { q, projects: projectsHit, runs: runsHit, artifacts: artifactsHit, images: imagesHit, agents: agentsHit });
+    }
+
     if (pathname === "/api/metrics" && req.method === "GET") {
       const runs = allRuns();
       return json(res, 200, {
@@ -689,7 +752,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { harness });
     }
     if (pathname === "/api/keys" && req.method === "GET") {
-      return json(res, 200, { ...keys.list(), presets: PRESETS, spend: Object.fromEntries((keys.list().keys ?? []).map((k) => [k.id, engine.keySpend(k.id)])) });
+      return json(res, 200, { ...keys.list(), presets: PRESETS, spend: Object.fromEntries((keys.list().keys ?? []).map((k) => [k.id, keySpendFromLogs(k.id)])) });
     }
 
     if (pathname === "/api/keys" && req.method === "POST") {
@@ -799,6 +862,76 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, out);
       } catch (err) {
         return json(res, 400, { error: String(err.message) });
+      }
+    }
+
+    if (pathname === "/api/studio/doc" && req.method === "POST") {
+      const body = await readBody(req, 2_000_000);
+      const sid = body.sessionId ?? undefined;
+      const text = String(body.text ?? "").trim();
+      if (text.length < 2) return json(res, 400, { error: "Пустой текст" });
+      if (isMock()) return json(res, 502, { error: "MOCK-режим: редактор не работает без ключа" });
+
+      // «грань»: большой документ правим только по орфографии, короткий запрос — можно переписать
+      const mode = ["help", "correct"].includes(body.mode) ? body.mode : text.length > 1200 ? "correct" : "help";
+      studio.threadAdd({ role: "user", text, docMode: mode }, sid);
+
+      const agent = engine.agent("scribe");
+      const started = Date.now();
+      try {
+        const out = await chat({
+          model: agent.model,
+          temperature: Number(agent.temperature ?? 0.3),
+          maxTokens: 4000,
+          apiKey: keys.resolve(agent.id)?.key ?? null,
+          system: agent.prompt,
+          user: `Режим: ${mode}. ${mode === "correct" ? "Только орфография и пунктуация, смысл и формулировки не менять." : "Можно переписать и структурировать."}\n\nТекст заказчика:\n"""\n${text}\n"""`,
+        });
+        const data = extractJson(out.text);
+        const msg = studio.threadAdd(
+          {
+            role: "doc",
+            title: String(data.title ?? "Документ"),
+            markdown: String(data.markdown ?? ""),
+            mode: String(data.mode ?? mode),
+            reasoning: String(data.reasoning ?? ""),
+            cost: out.usage.cost,
+            ms: Date.now() - started,
+          },
+          sid
+        );
+        return json(res, 200, { message: msg, thread: studio.threadList(sid, 80) });
+      } catch (err) {
+        return json(res, 502, { error: String(err?.message || err) });
+      }
+    }
+
+    const dm = pathname.match(/^\/api\/studio\/doc\/([\w-]+)\.(md|docx)$/);
+    if (dm && req.method === "GET") {
+      const found = studio.findMessage(dm[1]);
+      if (!found || found.message.role !== "doc") return json(res, 404, { error: "Документ не найден" });
+      const doc = found.message;
+      const name = String(doc.title ?? "document").replace(/[^\wа-яА-Я\d _-]+/gi, "").trim().slice(0, 60) || "document";
+
+      if (dm[2] === "md") {
+        res.writeHead(200, {
+          "Content-Type": "text/markdown; charset=utf-8",
+          "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(name)}.md`,
+        });
+        return res.end(String(doc.markdown ?? ""));
+      }
+
+      try {
+        const { markdownToDocx } = await import("./lib/docx.mjs");
+        const buf = markdownToDocx(String(doc.markdown ?? ""), { title: doc.title });
+        res.writeHead(200, {
+          "Content-Type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+          "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(name)}.docx`,
+          "Content-Length": buf.length,
+        });
+        return res.end(buf);
+      } catch (err) {
+        return json(res, 501, { error: `DOCX пока недоступен: ${err.message}` });
       }
     }
 

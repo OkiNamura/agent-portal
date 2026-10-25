@@ -298,6 +298,16 @@ table.tbl td { padding: 7px 8px; border-bottom: 1px solid #171e28; font-family: 
 .shot .meta { display: flex; gap: 12px; flex-wrap: wrap; font-family: var(--mono); font-size: 10.5px; color: #5f6f85; }
 .shot .prompt { font-size: 12.5px; color: #c3cfdf; }
 .shot .acts { display: flex; gap: 8px; }
+/* документы */
+.docCard { align-self: flex-start; width: min(820px, 100%); border: 1px solid #2c3750; border-radius: 14px; background: #101725; padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; }
+.docHead { display: flex; align-items: center; gap: 10px; }
+.docHead b { font-size: 14px; }
+.docHead .tag { font-size: 10px; padding: 1px 7px; border-radius: 999px; border: 1px solid #2c3750; color: var(--accent); }
+.docPreview { max-height: 320px; overflow: auto; border: 1px solid var(--line); border-radius: 10px; background: #0a0d12; padding: 10px 12px; font-size: 12.5px; }
+.docPreview h1, .docPreview h2, .docPreview h3 { font-size: 14px; margin: 10px 0 6px; color: #e7eef8; }
+.docPreview pre { font-family: var(--mono); font-size: 11.5px; white-space: pre-wrap; background: #111823; padding: 8px; border-radius: 8px; }
+.docPreview p { margin: 5px 0; }
+
 /* ключи и лимиты */
 .keysBody { padding: 6px 18px 24px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; }
 .presetRow { display: flex; gap: 10px; flex-wrap: wrap; }

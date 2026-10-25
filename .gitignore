@@ -16,3 +16,4 @@ output/
 node_modules/
 *.log
 *.tmp
+tmp-docx-test.docx

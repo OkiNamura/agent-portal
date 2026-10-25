@@ -28,6 +28,7 @@
     <button data-page="studio"><span class="ico">✷</span><span>Картинки</span></button>
     <button data-page="stats"><span class="ico">▤</span><span>Статистика</span></button>
     <button data-page="keys"><span class="ico">⚿</span><span>Ключи</span></button>
+    <button data-page="search"><span class="ico">⌕</span><span>Поиск</span></button>
     <button data-page="assistant"><span class="ico">✎</span><span>Ассистент</span></button>
   </nav>
 
@@ -108,6 +109,7 @@
             <div class="viewerHead">
               <span id="diffTitle" class="dim">выбери файл</span>
               <span class="spacer"></span>
+              <select id="diffBase" class="miniSelect" title="С чем сравнивать"></select>
               <label class="chk"><input type="checkbox" id="onlyChanges" checked /> только изменения</label>
             </div>
             <div id="diffBody" class="viewerBody diffBody"></div>
@@ -183,6 +185,19 @@
         <div class="dim">Несколько ключей OpenRouter, дневные лимиты, привязка агентов и быстрые пресеты моделей.</div>
       </div>
       <div class="keysBody" id="keysBody"></div>
+    </div>
+
+    <!-- ПОИСК -->
+    <div id="pageSearch" class="page hidden">
+      <div class="pageHead">
+        <h1>Поиск</h1>
+        <div class="dim">Проекты, прогоны, артефакты, картинки и агенты — по одному запросу.</div>
+      </div>
+      <div class="searchBar">
+        <input id="searchInput" placeholder="Например: калькулятор, обложка, spec.md" />
+        <button id="searchBtn" class="primary">Найти</button>
+      </div>
+      <div id="searchResults" class="searchResults"></div>
     </div>
 
     <!-- АССИСТЕНТ -->
