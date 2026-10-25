@@ -2385,7 +2385,7 @@ $("#imgSend").addEventListener("click", sendStudio);
 $("#studioClear").addEventListener("click", async () => {
   if (!confirm("Очистить чат? Картинки останутся в файлах, история переписки пропадёт.")) return;
   try {
-    const { thread } = await api("/api/studio/clear", { method: "POST" });
+    const { thread } = await api("/api/studio/clear", { method: "POST", body: JSON.stringify({ sessionId: S.studio.activeId }) });
     S.studio.thread = thread ?? [];
     renderThread();
   } catch (err) {
@@ -2425,7 +2425,8 @@ $("#cornerBtn").addEventListener("click", async () => {  const panel = $("#corne
     renderCorner();
     $("#cornerInput").focus();
     await pollCorner();
-    api("/api/mailbox/read", { method: "POST", body: JSON.stringify({ ids: [] }) }).catch(() => {});
+    const shown = (S.corner.items ?? []).slice(-40).map((m) => m.id);
+    if (shown.length) api("/api/mailbox/read", { method: "POST", body: JSON.stringify({ ids: shown }) }).catch(() => {});
     setTimeout(pollCorner, 800);
   }
 });

@@ -74,6 +74,9 @@ const PRESET_MODELS = {
     critic: "google/gemini-2.5-flash-lite",
     artist: "qwen/qwen3.7-flash",
     assistant: "qwen/qwen3.7-flash",
+    mockup: "qwen/qwen3.7-flash",
+    scribe: "qwen/qwen3.7-flash",
+    reviewer: "qwen/qwen3.7-flash",
   },
   speed: {
     orchestrator: "google/gemini-2.5-flash-lite",
@@ -84,6 +87,9 @@ const PRESET_MODELS = {
     critic: "google/gemini-2.5-flash-lite",
     artist: "google/gemini-2.5-flash-lite",
     assistant: "google/gemini-2.5-flash-lite",
+    mockup: "google/gemini-2.5-flash-lite",
+    scribe: "google/gemini-2.5-flash-lite",
+    reviewer: "google/gemini-2.5-flash-lite",
   },
   quality: {
     orchestrator: "deepseek/deepseek-v3.2",
@@ -94,6 +100,9 @@ const PRESET_MODELS = {
     critic: "deepseek/deepseek-v3.2",
     artist: "deepseek/deepseek-v3.2",
     assistant: "deepseek/deepseek-v3.2",
+    mockup: "anthropic/claude-haiku-5.5",
+    scribe: "deepseek/deepseek-v3.2",
+    reviewer: "deepseek/deepseek-v3.2",
   },
 };
 const store = new Store(ROOT);
@@ -103,6 +112,13 @@ bus.setMaxListeners(200);
 const keys = new Keys(ROOT);
 const engine = new Engine({ store, config, bus, keys });
 engine.spendProvider = keySpendFromLogs;
+
+/** Ключ из настроек должен включать LIVE, даже если в .env его нет. */
+function syncKeyToEnv() {
+  const k = keys.resolve(null);
+  if (k?.key) process.env.OPENROUTER_API_KEY = k.key;
+}
+syncKeyToEnv();
 
 const mailbox = new Mailbox(ROOT);
 const studio = new Studio(ROOT);
@@ -253,6 +269,12 @@ function keySpendFromLogs(keyId) {
         if (!String(e.at ?? "").startsWith(day)) continue;
         byKey[e.keyId] = (byKey[e.keyId] ?? 0) + (e.usage?.cost ?? 0);
       }
+    }
+    // картинки и документы студии тоже считаются — они самая дорогая часть
+    for (const img of studio.items ?? []) {
+      if (!img.keyId) continue;
+      if (!String(img.at ?? "").startsWith(day)) continue;
+      byKey[img.keyId] = (byKey[img.keyId] ?? 0) + (img.cost ?? 0);
     }
     keySpendCache = { at: Date.now(), byKey };
   }
@@ -684,7 +706,13 @@ const server = http.createServer(async (req, res) => {
 
       const artifactsHit = [];
       for (const r of runs) {
-        for (const a of r.artifacts ?? []) {
+        let list = [];
+        try {
+          list = store.listArtifacts(r);
+        } catch {
+          list = [];
+        }
+        for (const a of list) {
           if (a.path.toLowerCase().includes(q)) {
             artifactsHit.push({ runId: r.id, projectId: r.projectId, path: a.path });
             if (artifactsHit.length >= 15) break;
@@ -758,7 +786,9 @@ const server = http.createServer(async (req, res) => {
     if (pathname === "/api/keys" && req.method === "POST") {
       const body = await readBody(req);
       try {
-        return json(res, 200, keys.add({ label: body.label, key: body.key, limitDaily: body.limitDaily }));
+        const out = keys.add({ label: body.label, key: body.key, limitDaily: body.limitDaily });
+        syncKeyToEnv();
+        return json(res, 200, out);
       } catch (err) {
         return json(res, 400, { error: String(err.message) });
       }
@@ -769,14 +799,18 @@ const server = http.createServer(async (req, res) => {
     if (km && !KEYS_RESERVED.has(km[1]) && req.method === "POST") {
       const body = await readBody(req);
       try {
-        return json(res, 200, keys.patch(km[1], body));
+        const out = keys.patch(km[1], body);
+        syncKeyToEnv();
+        return json(res, 200, out);
       } catch (err) {
         return json(res, 400, { error: String(err.message) });
       }
     }
     if (km && !KEYS_RESERVED.has(km[1]) && req.method === "DELETE") {
       try {
-        return json(res, 200, keys.remove(km[1]));
+        const out = keys.remove(km[1]);
+        syncKeyToEnv();
+        return json(res, 200, out);
       } catch (err) {
         return json(res, 400, { error: String(err.message) });
       }
@@ -794,7 +828,9 @@ const server = http.createServer(async (req, res) => {
     if (pathname === "/api/keys/default" && req.method === "POST") {
       const body = await readBody(req);
       try {
-        return json(res, 200, keys.setDefault(body.id ?? null));
+        const out = keys.setDefault(body.id ?? null);
+        syncKeyToEnv();
+        return json(res, 200, out);
       } catch (err) {
         return json(res, 400, { error: String(err.message) });
       }
@@ -842,8 +878,13 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === "/api/studio/thread" && req.method === "GET") {
       const sid = url.searchParams.get("session") ?? undefined;
-      if (sid) studio.activeId = sid;
-      return json(res, 200, { thread: studio.threadList(sid, 80), activeId: studio.activeId });
+      try {
+        const thread = studio.threadList(sid, 80); // внутри проверяется существование чата
+        if (sid) studio.activeId = sid;
+        return json(res, 200, { thread, activeId: studio.activeId });
+      } catch (err) {
+        return json(res, 404, { error: String(err.message) });
+      }
     }
 
     const sm = pathname.match(/^\/api\/studio\/sessions\/([\w-]+)$/);
@@ -1025,6 +1066,7 @@ const server = http.createServer(async (req, res) => {
         refId = item.id;
       }
 
+      const imgKey = keys.resolve("studio");
       const requested = String(body.model ?? "google/gemini-3.1-flash-image");
       try {
         let out;
@@ -1033,6 +1075,7 @@ const server = http.createServer(async (req, res) => {
           out = await generateImage({
             model: requested,
             prompt,
+            apiKey: imgKey?.key,
             aspectRatio: body.aspectRatio ? String(body.aspectRatio) : undefined,
             quality: body.quality ? String(body.quality) : undefined,
             references,
@@ -1044,6 +1087,7 @@ const server = http.createServer(async (req, res) => {
           out = await generateImage({
             model: usedModel,
             prompt,
+            apiKey: imgKey?.key,
             aspectRatio: body.aspectRatio ? String(body.aspectRatio) : undefined,
             references,
           });
@@ -1058,6 +1102,7 @@ const server = http.createServer(async (req, res) => {
           cost: out.cost,
           ms: out.ms,
           refId,
+          keyId: imgKey?.id ?? null,
         });
         const msg = studio.threadAdd({ role: "result", text: prompt, imageId: item.id, file: item.file, cost: item.cost, ms: item.ms, model: item.model, ref: refId }, body.sessionId ?? undefined);
         return json(res, 200, { item, message: msg, url: `/studio/${item.file}`, thread: studio.threadList(body.sessionId ?? undefined, 80) });
@@ -1247,6 +1292,7 @@ async function makeProposal(text, referenceId = null, sessionId = undefined) {
   try {
     const out = await chat({
       model: agent.model,
+      apiKey: keys.resolve("artist")?.key ?? null,
       temperature: Number(agent.temperature ?? 0.4),
       maxTokens: 1200,
       system: agent.prompt,
@@ -1336,6 +1382,7 @@ async function assistantAnswer(question, history) {
 
   const res = await chat({
     model: agent.model,
+    apiKey: keys.resolve("assistant")?.key ?? null,
     temperature: Number(agent.temperature ?? 0.2),
     maxTokens: 1200,
     system: agent.prompt,
