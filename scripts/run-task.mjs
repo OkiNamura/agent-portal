@@ -9,11 +9,31 @@ if (!TASK) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const api = async (path, opts = {}) => {
-  const res = await fetch(BASE + path, { headers: { "Content-Type": "application/json" }, signal: AbortSignal.timeout(30_000), ...opts });
+  const res = await fetch(BASE + path, {
+    headers: { "Content-Type": "application/json", ...(cookie ? { Cookie: cookie } : {}) },
+    signal: AbortSignal.timeout(30_000),
+    ...opts,
+  });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(`${path} → ${res.status}: ${data.error ?? ""}`);
   return data;
 };
+
+// портал закрыт авторизацией: логин из окружения, пароль в репозиторий не пишем
+let cookie = "";
+if (process.env.PORTAL_PASS) {
+  const r = await fetch(BASE + "/api/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ login: process.env.PORTAL_LOGIN || "admin", password: process.env.PORTAL_PASS }),
+  });
+  if (!r.ok) {
+    console.error("логин не удался:", r.status, await r.text());
+    process.exit(2);
+  }
+  cookie = (r.headers.getSetCookie?.() ?? [])[0]?.split(";")[0] ?? "";
+  console.log("вход выполнен");
+}
 
 const t0 = Date.now();
 const stamp = () => String(Math.round((Date.now() - t0) / 1000)).padStart(4) + "с";
