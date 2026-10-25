@@ -30,7 +30,7 @@ const S = {
   modelsTried: false,
   logCutoff: 0,
   metrics: null,
-  studio: { thread: [], models: [], refItem: null, refData: null, lastText: "" },
+  studio: { thread: [], models: [], sessions: [], activeId: null, refItem: null, refData: null, lastText: "" },
   corner: { items: [], unread: 0, alerts: [] },
   diff: { runId: null, data: null, file: null },
   tab: "flow",
@@ -96,6 +96,7 @@ function setPage(page) {
   if (page === "studio") loadStudio();
   if (page === "assistant") {
     renderChat();
+    setAssistTab("chat");
     setTimeout(() => $("#askInput")?.focus(), 50);
   }
 }
@@ -165,20 +166,63 @@ function renderList() {
     return;
   }
 
-  const head = el("div", "listHead");
-  head.append(el("span", null, "Разделы"));
-  box.append(head);
-  for (const [label, anchor] of [["Расход", "#statsBody"], ["Модели", "#statsBody"]]) {
-    const item = el("div", "item");
-    const txt = el("div", "txt");
-    txt.append(el("div", "n", label), el("div", "m", "сводка"));
-    item.append(txt);
-    item.addEventListener("click", () => document.querySelector(anchor)?.scrollIntoView({ behavior: "smooth" }));
-    box.append(item);
+  if (S.page === "studio") {
+    const head = el("div", "listHead");
+    head.append(el("span", null, "Чаты"));
+    const add = el("button", "mini", "+");
+    add.title = "Новый чат";
+    add.addEventListener("click", newSession);
+    head.append(add);
+    box.append(head);
+
+    if (!S.studio.sessions.length) box.append(el("div", "empty", "пока нет чатов"));
+    for (const s of S.studio.sessions) {
+      const item = el("div", "item" + (s.id === S.studio.activeId ? " active" : ""));
+      const txt = el("div", "txt");
+      txt.append(el("div", "n", s.name), el("div", "m", `${s.kind === "images" ? "картинки" : s.kind} · сообщений: ${s.messages}`));
+      const kill = el("button", "kill", "✕");
+      kill.title = "Удалить чат";
+      kill.addEventListener("click", (e) => {
+        e.stopPropagation();
+        removeSession(s);
+      });
+      item.append(txt, kill);
+      item.addEventListener("click", () => switchSession(s.id));
+      item.addEventListener("dblclick", () => renameSession(s));
+      box.append(item);
+    }
+    return;
+  }
+
+  if (S.page === "stats") {
+    const head = el("div", "listHead");
+    head.append(el("span", null, "Разделы"));
+    box.append(head);
+    for (const [label, anchor] of [["Расход", "statsCost"], ["Модели", "statsModels"], ["Проекты", "statsProjects"], ["Агенты", "statsAgents"], ["Дни", "statsDays"]]) {
+      const item = el("div", "item");
+      const txt = el("div", "txt");
+      txt.append(el("div", "n", label), el("div", "m", "перейти"));
+      item.append(txt);
+      item.addEventListener("click", () => document.getElementById(anchor)?.scrollIntoView({ behavior: "smooth", block: "start" }));
+      box.append(item);
+    }
+    return;
   }
 }
 
 /* ------------------------------ картинки ------------------------------ */
+
+// подсказки по моделям: цена / качество / скорость. Итоговый выбор всегда за пользователем.
+const MODEL_TIPS = {
+  price: ["bytedance-seed/seedream-5-0-flash", "google/gemini-3.1-flash-lite-image", "qwen/qwen-image-2.1-turbo", "black-forest-labs/flux-3-image-klein"],
+  quality: ["openai/gpt-image-2", "black-forest-labs/flux-3-image", "google/gemini-3-pro-image", "bytedance-seed/seedream-5-0-pro"],
+  speed: ["google/gemini-3.1-flash-image", "bytedance-seed/seedream-5-0-flash", "qwen/qwen-image-2.1-turbo"],
+  note: {
+    price: "эти модели дешевле — примерно $0.01–0.03 за картинку",
+    quality: "дороже (до $0.13), но детальнее и лучше держат текст",
+    speed: "быстрые: 5–10 секунд на картинку",
+  },
+};
 
 async function loadStudio() {
   if (!S.studio.models.length) {
@@ -201,9 +245,68 @@ async function loadStudio() {
     }
   }
   try {
-    const { thread } = await api("/api/studio/thread");
-    S.studio.thread = thread ?? [];
-    renderThread();
+    const { sessions, activeId } = await api("/api/studio/sessions");
+    S.studio.sessions = sessions ?? [];
+    const keep = S.studio.activeId && S.studio.sessions.some((s) => s.id === S.studio.activeId);
+    S.studio.activeId = keep ? S.studio.activeId : activeId ?? S.studio.sessions[0]?.id;
+    await loadThread();
+    renderList();
+  } catch (err) {
+    $("#studioInfo").textContent = err.message;
+  }
+}
+
+async function loadThread() {
+  if (!S.studio.activeId) return;
+  const { thread } = await api(`/api/studio/thread?session=${encodeURIComponent(S.studio.activeId)}`);
+  S.studio.thread = thread ?? [];
+  renderThread();
+}
+
+function switchSession(id) {
+  S.studio.activeId = id;
+  S.studio.refItem = null;
+  S.studio.refData = null;
+  renderChip();
+  renderList();
+  loadThread().catch((err) => ($("#studioInfo").textContent = err.message));
+}
+
+async function newSession() {
+  const name = prompt("Название чата", "Новый чат");
+  if (name == null) return;
+  try {
+    const j = await api("/api/studio/sessions", { method: "POST", body: JSON.stringify({ name, kind: "images" }) });
+    S.studio.sessions = j.sessions;
+    S.studio.activeId = j.activeId;
+    renderList();
+    await loadThread();
+  } catch (err) {
+    $("#studioInfo").textContent = err.message;
+  }
+}
+
+async function renameSession(s) {
+  const name = prompt("Новое название чата", s.name);
+  if (name == null) return;
+  try {
+    await api(`/api/studio/sessions/${s.id}`, { method: "POST", body: JSON.stringify({ name }) });
+    const { sessions } = await api("/api/studio/sessions");
+    S.studio.sessions = sessions;
+    renderList();
+  } catch (err) {
+    $("#studioInfo").textContent = err.message;
+  }
+}
+
+async function removeSession(s) {
+  if (!confirm(`Удалить чат «${s.name}»? Картинки останутся в файлах.`)) return;
+  try {
+    const j = await api(`/api/studio/sessions/${s.id}`, { method: "DELETE" });
+    S.studio.sessions = j.sessions;
+    S.studio.activeId = j.activeId;
+    renderList();
+    await loadThread();
   } catch (err) {
     $("#studioInfo").textContent = err.message;
   }
@@ -219,6 +322,11 @@ function lastResultId() {
 function renderThread() {
   const box = $("#studioFeed");
   box.textContent = "";
+  const sess = S.studio.sessions.find((s) => s.id === S.studio.activeId);
+  if (sess && sess.kind !== "images") {
+    box.append(el("div", "empty", `Этот чат типа «${sess.kind}» ещё в разработке. Сейчас работает только «картинки» — создай новый чат или переключись.`));
+    return;
+  }
   if (!S.studio.thread.length) {
     box.append(el("div", "empty", "Опиши, что хочешь — художник перепишет это в промт, покажет, что отправит, и нарисует после твоего «Отправить»."));
     return;
@@ -237,7 +345,8 @@ function renderThread() {
 
 /* общая обёртка для вызовов студии, чтобы не дублировать обновление треда */
 async function studioCall(path, body) {
-  const data = await api(path, { method: "POST", body: JSON.stringify(body ?? {}) });
+  const payload = { ...(body ?? {}), sessionId: S.studio.activeId };
+  const data = await api(path, { method: "POST", body: JSON.stringify(payload) });
   if (data.thread) {
     S.studio.thread = data.thread;
     renderThread();
@@ -373,6 +482,28 @@ function proposalCard(msg) {
   );
   row.append(go);
   card.append(row);
+
+  // подсказки: какая модель лучше по цене / качеству / скорости — выбор остаётся за тобой
+  const tips = el("div", "pRow");
+  tips.append(el("span", "dim", "подсказать:"));
+  const TIPS = [
+    ["по цене", "price"],
+    ["по качеству", "quality"],
+    ["по скорости", "speed"],
+  ];
+  const note = el("span", "dim");
+  for (const [label, key] of TIPS) {
+    const b = el("button", "mini", label);
+    b.addEventListener("click", () => {
+      const picked = MODEL_TIPS[key].find((id) => S.studio.models.some((m) => m.id === id));
+      if (picked) model.value = picked;
+      note.textContent = MODEL_TIPS.note[key];
+      tips.querySelectorAll("button").forEach((x) => x.classList.toggle("active", x === b));
+    });
+    tips.append(b);
+  }
+  tips.append(note);
+  card.append(tips);
 
   card.append(
     actionsRow([
@@ -531,6 +662,63 @@ async function anotherProposal(msg) {
 }
 
 /* ------------------------------ ассистент ------------------------------ */
+
+async function setAssistTab(tab) {
+  document.querySelectorAll("#assistTabs button").forEach((b) => b.classList.toggle("active", b.dataset.atab === tab));
+  $("#assistChat").classList.toggle("hidden", tab !== "chat");
+  $("#assistLogs").classList.toggle("hidden", tab !== "logs");
+  $("#assistErrors").classList.toggle("hidden", tab !== "errors");
+  $("#assistMail").classList.toggle("hidden", tab !== "mail");
+  if (tab === "chat") return renderChat();
+
+  if (tab === "logs" || tab === "errors") {
+    const box = tab === "logs" ? $("#assistLogList") : $("#assistErrorList");
+    box.textContent = "…";
+    try {
+      const { logs } = await api("/api/logs?limit=150");
+      let rows = logs;
+      if (tab === "errors") {
+        const { alerts } = await api("/api/alerts");
+        rows = [
+          ...alerts.map((a) => ({ at: new Date().toISOString(), kind: a.level === "bad" ? "error" : "gate", project: "наблюдатель", message: a.text })),
+          ...logs.filter((l) => l.kind === "error" || l.kind === "call_failed"),
+        ];
+      }
+      box.textContent = "";
+      if (!rows.length) box.append(el("div", "empty", tab === "errors" ? "ошибок нет" : "лог пуст"));
+      for (const l of rows.slice(0, 150)) {
+        const row = el("div", "row");
+        row.append(
+          el("span", "t", hhmmss(l.at)),
+          el("span", "p", (l.project ?? "").slice(0, 22)),
+          el("span", "m " + (l.kind === "error" ? "error" : l.kind === "gate" ? "gate" : ""), l.message)
+        );
+        box.append(row);
+      }
+    } catch (err) {
+      box.textContent = "Ошибка: " + err.message;
+    }
+    return;
+  }
+
+  if (tab === "mail") {
+    const box = $("#assistMailList");
+    box.textContent = "…";
+    try {
+      const { items } = await api("/api/mailbox");
+      box.textContent = "";
+      if (!items.length) box.append(el("div", "empty", "сообщений нет"));
+      for (const m of [...items].reverse()) {
+        const row = el("div", "row");
+        const who = m.from === "user" ? "ты" : m.from === "harness" ? "харнесс" : m.from === "assistant" ? "ассистент" : "портал";
+        row.append(el("span", "t", hhmmss(m.at)), el("span", "p", who), el("span", "m", m.text));
+        box.append(row);
+      }
+    } catch (err) {
+      box.textContent = "Ошибка: " + err.message;
+    }
+  }
+}
 
 async function cleanupDisk() {
   if (!confirm("Удалить с диска каталоги прогонов, которые не привязаны ни к одному проекту?")) return;
@@ -848,12 +1036,15 @@ async function loadStats() {
     const totalRuns = Object.values(stats.byStatus).reduce((a, b) => a + b, 0);
     add(String(totalRuns), "прогонов");
     add(String(stats.byStatus.done ?? 0), "завершено");
+    cards.id = "statsCost";
     box.append(cards);
 
     await renderAgentMetrics(box);
 
     if (stats.byModel.length) {
-      box.append(el("div", "sectionTitle", "По моделям"));
+      const title = el("div", "sectionTitle", "По моделям");
+      title.id = "statsModels";
+      box.append(title);
       const t = el("table", "tbl");
       t.innerHTML = "<thead><tr><th>Модель</th><th>Вызовов</th><th>Стоимость</th></tr></thead>";
       const tb = document.createElement("tbody");
@@ -867,7 +1058,9 @@ async function loadStats() {
     }
 
     if (stats.projects.length) {
-      box.append(el("div", "sectionTitle", "По проектам"));
+      const title = el("div", "sectionTitle", "По проектам");
+      title.id = "statsProjects";
+      box.append(title);
       const maxCost = Math.max(...stats.projects.map((p) => p.cost), 0.000001);
       const t = el("table", "tbl");
       t.innerHTML = "<thead><tr><th>Проект</th><th>Версий</th><th>Готово</th><th>Стоимость</th><th></th></tr></thead>";
@@ -888,7 +1081,9 @@ async function loadStats() {
     }
 
     if (stats.byDay.length) {
-      box.append(el("div", "sectionTitle", "По дням"));
+      const title = el("div", "sectionTitle", "По дням");
+      title.id = "statsDays";
+      box.append(title);
       const t = el("table", "tbl");
       t.innerHTML = "<thead><tr><th>День</th><th>Стоимость</th></tr></thead>";
       const tb = document.createElement("tbody");
@@ -932,7 +1127,9 @@ async function renderAgentMetrics(box) {
   const { agents, verdicts } = await loadMetrics({ force: true });
   if (!agents.length) return;
 
-  box.append(el("div", "sectionTitle", "По агентам: кто работает, кто косячит"));
+  const title = el("div", "sectionTitle", "По агентам: кто работает, кто косячит");
+  title.id = "statsAgents";
+  box.append(title);
   const t = el("table", "tbl");
   t.innerHTML =
     "<thead><tr><th>Агент</th><th>Модель</th><th>Вызовов</th><th>Ошибок</th><th>Средний ответ</th><th>Правок</th><th>Проверки</th><th>Стоимость</th></tr></thead>";
@@ -1792,6 +1989,7 @@ $("#reloadPreview").addEventListener("click", () => {
   }
 });
 document.querySelectorAll("#tabs button[data-tab]").forEach((b) => b.addEventListener("click", () => setTab(b.dataset.tab)));
+document.querySelectorAll("#assistTabs button").forEach((b) => b.addEventListener("click", () => setAssistTab(b.dataset.atab)));
 document.querySelectorAll(".seg button").forEach((b) => b.addEventListener("click", () => setView(b.dataset.view)));
 $("#onlyChanges").addEventListener("change", () => {
   const file = S.diff.data?.files.find((f) => f.path === S.diff.file);

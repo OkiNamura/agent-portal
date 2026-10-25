@@ -648,18 +648,52 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { harness });
     }
 
+    if (pathname === "/api/studio/sessions" && req.method === "GET") {
+      return json(res, 200, { sessions: studio.listSessions(), activeId: studio.activeId });
+    }
+
+    if (pathname === "/api/studio/sessions" && req.method === "POST") {
+      const body = await readBody(req);
+      const session = studio.createSession({ name: body.name, kind: body.kind });
+      return json(res, 200, { session, sessions: studio.listSessions(), activeId: studio.activeId });
+    }
+
     if (pathname === "/api/studio/thread" && req.method === "GET") {
-      return json(res, 200, { thread: studio.threadList(80) });
+      const sid = url.searchParams.get("session") ?? undefined;
+      if (sid) studio.activeId = sid;
+      return json(res, 200, { thread: studio.threadList(sid, 80), activeId: studio.activeId });
+    }
+
+    const sm = pathname.match(/^\/api\/studio\/sessions\/([\w-]+)$/);
+    if (sm && req.method === "POST") {
+      const body = await readBody(req);
+      try {
+        const session = studio.renameSession(sm[1], body.name);
+        return json(res, 200, { session, sessions: studio.listSessions() });
+      } catch (err) {
+        return json(res, 404, { error: String(err.message) });
+      }
+    }
+    if (sm && req.method === "DELETE") {
+      try {
+        const out = studio.deleteSession(sm[1]);
+        return json(res, 200, out);
+      } catch (err) {
+        return json(res, 400, { error: String(err.message) });
+      }
     }
 
     if (pathname === "/api/studio/say" && req.method === "POST") {
       const body = await readBody(req, 14_000_000);
+      const sid = body.sessionId ?? undefined;
       const text = String(body.text ?? "").trim();
       if (text.length < 2) return json(res, 400, { error: "Пустой запрос" });
-      studio.threadAdd({ role: "user", text, ref: body.referenceId ?? null });
-      const result = await makeProposal(text, body.referenceId ?? null);
-      if (result.error) return json(res, 502, { error: result.error, thread: studio.threadList(80) });
-      return json(res, 200, { proposal: result.proposal, thread: studio.threadList(80) });
+      const sess = studio.sessions.find((s) => s.id === (sid ?? studio.activeId));
+      if (sess && sess.kind !== "images") return json(res, 501, { error: `Чат типа «${sess.kind}» ещё в разработке — сейчас работает только «картинки»` });
+      studio.threadAdd({ role: "user", text, ref: body.referenceId ?? null }, sid);
+      const result = await makeProposal(text, body.referenceId ?? null, sid);
+      if (result.error) return json(res, 502, { error: result.error, thread: studio.threadList(sid, 80) });
+      return json(res, 200, { proposal: result.proposal, thread: studio.threadList(sid, 80) });
     }
 
     if (pathname === "/api/studio/upload" && req.method === "POST") {
@@ -685,11 +719,12 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === "/api/studio/propose" && req.method === "POST") {
       const body = await readBody(req);
+      const sid = body.sessionId ?? undefined;
       const text = String(body.text ?? "").trim();
       if (text.length < 2) return json(res, 400, { error: "Пустой запрос" });
-      const result = await makeProposal(text);
-      if (result.error) return json(res, 502, { error: result.error, thread: studio.threadList(80) });
-      return json(res, 200, { proposal: result.proposal, thread: studio.threadList(80) });
+      const result = await makeProposal(text, body.referenceId ?? null, sid);
+      if (result.error) return json(res, 502, { error: result.error, thread: studio.threadList(sid, 80) });
+      return json(res, 200, { proposal: result.proposal, thread: studio.threadList(sid, 80) });
     }
 
     if (pathname === "/api/studio/edit" && req.method === "POST") {
@@ -699,8 +734,8 @@ const server = http.createServer(async (req, res) => {
       if (!id) return json(res, 400, { error: "Не указано сообщение" });
       if (text.length < 2) return json(res, 400, { error: "Пустой текст" });
       try {
-        const res2 = studio.editMessage(id, { text });
-        return json(res, 200, { ...res2, thread: studio.threadList(80) });
+        const out = studio.editMessage(id, { text }, body.sessionId ?? undefined);
+        return json(res, 200, { ...out, thread: studio.threadList(body.sessionId ?? undefined, 80) });
       } catch (err) {
         return json(res, 404, { error: String(err.message) });
       }
@@ -711,15 +746,16 @@ const server = http.createServer(async (req, res) => {
       const id = String(body.id ?? "");
       if (!id) return json(res, 400, { error: "Не указано сообщение" });
       try {
-        const res2 = studio.truncateFrom(id);
-        return json(res, 200, { ...res2, thread: studio.threadList(80) });
+        const out = studio.truncateFrom(id, body.sessionId ?? undefined);
+        return json(res, 200, { ...out, thread: studio.threadList(body.sessionId ?? undefined, 80) });
       } catch (err) {
         return json(res, 404, { error: String(err.message) });
       }
     }
 
     if (pathname === "/api/studio/clear" && req.method === "POST") {
-      return json(res, 200, studio.clearThread());
+      const body = await readBody(req).catch(() => ({}));
+      return json(res, 200, { ...studio.clearThread(body.sessionId ?? undefined), thread: [] });
     }
 
     if (pathname === "/api/studio/generate" && req.method === "POST") {
@@ -771,8 +807,8 @@ const server = http.createServer(async (req, res) => {
           ms: out.ms,
           refId,
         });
-        const msg = studio.threadAdd({ role: "result", text: prompt, imageId: item.id, file: item.file, cost: item.cost, ms: item.ms, model: item.model, ref: refId });
-        return json(res, 200, { item, message: msg, url: `/studio/${item.file}`, thread: studio.threadList(80) });
+        const msg = studio.threadAdd({ role: "result", text: prompt, imageId: item.id, file: item.file, cost: item.cost, ms: item.ms, model: item.model, ref: refId }, body.sessionId ?? undefined);
+        return json(res, 200, { item, message: msg, url: `/studio/${item.file}`, thread: studio.threadList(body.sessionId ?? undefined, 80) });
       } catch (err) {
         return json(res, 502, { error: String(err?.message || err) });
       }
@@ -942,7 +978,7 @@ const server = http.createServer(async (req, res) => {
 /* --------------------------- ассистент портала --------------------------- */
 
 /** Художник: переписывает человеческий запрос в промт и объясняет, как понял задачу. */
-async function makeProposal(text, referenceId = null) {
+async function makeProposal(text, referenceId = null, sessionId = undefined) {
   if (isMock()) return { error: "MOCK-режим: художник не работает без ключа" };
   const refItem = referenceId ? studio.get(String(referenceId)) : null;
   const refNote = refItem ? `\n\nЗаказчик приложил картинку-референс (${refItem.id}). Это запрос на правку: опиши в промте, что менять, а что оставить, и используй формулировки вроде "keep the composition".` : "";
@@ -976,7 +1012,7 @@ async function makeProposal(text, referenceId = null) {
       ref: referenceId,
       cost: out.usage.cost,
       ms: Date.now() - started,
-    });
+    }, sessionId);
     return { proposal };
   } catch (err) {
     return { error: String(err?.message || err) };

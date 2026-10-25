@@ -167,7 +167,8 @@
     </div>
 
     <!-- СТАТИСТИКА -->
-    <div id="pageStats" class="page hidden">      <div class="pageHead">
+    <div id="pageStats" class="page hidden">
+      <div class="pageHead">
         <h1>Статистика</h1>
         <div class="dim">Считается по всем прогонам: расход, модели, проекты, дни.</div>
       </div>
@@ -178,15 +179,26 @@
     <div id="pageAssistant" class="page hidden">
       <div class="pageHead">
         <h1>Ассистент по порталу</h1>
-        <div class="dim">Знает проекты, версии, статусы, гейты, ошибки и расход. Спрашивай словами.</div>
+        <div class="dim">Знает проекты, версии, статусы, гейты, ошибки и расход. Спрашивай словами или смотри разделы.</div>
       </div>
-      <div id="chatBox" class="chatBox">
-        <div id="chatLog" class="chatLog"></div>
-        <div class="chatInput">
-          <input id="askInput" placeholder="Где остановился проект «Заметки»? Были ли ошибки?" />
-          <button id="askBtn" class="primary">Спросить</button>
+      <nav class="tabs" id="assistTabs">
+        <button data-atab="chat" class="active">Чат</button>
+        <button data-atab="logs">Логи</button>
+        <button data-atab="errors">Ошибки</button>
+        <button data-atab="mail">Сообщения</button>
+      </nav>
+      <div id="assistChat" class="assistPane">
+        <div id="chatBox" class="chatBox">
+          <div id="chatLog" class="chatLog"></div>
+          <div class="chatInput">
+            <input id="askInput" placeholder="Где остановился проект «Заметки»? Были ли ошибки?" />
+            <button id="askBtn" class="primary">Спросить</button>
+          </div>
         </div>
       </div>
+      <div id="assistLogs" class="assistPane hidden"><div id="assistLogList" class="assistList"></div></div>
+      <div id="assistErrors" class="assistPane hidden"><div id="assistErrorList" class="assistList"></div></div>
+      <div id="assistMail" class="assistPane hidden"><div id="assistMailList" class="assistList"></div></div>
     </div>
   </main>
 
