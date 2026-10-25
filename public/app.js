@@ -223,24 +223,111 @@ function renderThread() {
     box.append(el("div", "empty", "Опиши, что хочешь — художник перепишет это в промт, покажет, что отправит, и нарисует после твоего «Отправить»."));
     return;
   }
-  const spent = S.studio.thread.filter((m) => m.role === "result").reduce((s, m) => s + (m.cost || 0), 0);
-  $("#studioInfo").textContent = `картинок: ${S.studio.thread.filter((m) => m.role === "result").length} · потрачено $${spent.toFixed(3)}`;
+  const results = S.studio.thread.filter((m) => m.role === "result");
+  const spent = results.reduce((s, m) => s + (m.cost || 0), 0);
+  $("#studioInfo").textContent = `картинок: ${results.length} · потрачено $${spent.toFixed(3)}`;
 
   for (const msg of S.studio.thread) {
-    if (msg.role === "user") {
-      box.append(el("div", "bubble user", msg.text));
-    } else if (msg.role === "proposal") {
-      box.append(proposalCard(msg));
-    } else if (msg.role === "result") {
-      box.append(resultCard(msg));
-    }
+    if (msg.role === "user") box.append(userBubble(msg));
+    else if (msg.role === "proposal") box.append(proposalCard(msg));
+    else if (msg.role === "result") box.append(resultCard(msg));
   }
   box.scrollTop = box.scrollHeight;
 }
 
+/* общая обёртка для вызовов студии, чтобы не дублировать обновление треда */
+async function studioCall(path, body) {
+  const data = await api(path, { method: "POST", body: JSON.stringify(body ?? {}) });
+  if (data.thread) {
+    S.studio.thread = data.thread;
+    renderThread();
+  }
+  return data;
+}
+
+function actionsRow(buttons) {
+  const row = el("div", "msgActions");
+  for (const b of buttons) if (b) row.append(b);
+  return row;
+}
+
+function smallBtn(label, title, onClick, cls = "mini") {
+  const b = el("button", cls, label);
+  if (title) b.title = title;
+  b.addEventListener("click", onClick);
+  return b;
+}
+
+function textBefore(msg) {
+  const idx = S.studio.thread.indexOf(msg);
+  for (let i = idx - 1; i >= 0; i--) if (S.studio.thread[i].role === "user") return S.studio.thread[i].text;
+  return "";
+}
+
+function userBubble(msg) {
+  const wrap = el("div", "bubbleWrap");
+  const b = el("div", "bubble user", msg.text);
+  wrap.append(b);
+
+  const actions = actionsRow([
+    smallBtn("изменить", "Отредактировать и переписать промт", () => editUserMessage(msg, wrap)),
+    smallBtn("удалить ниже", "Откатиться: убрать это сообщение и всё после него", () => truncateAt(msg)),
+  ]);
+  wrap.append(actions);
+  return wrap;
+}
+
+function editUserMessage(msg, wrap) {
+  wrap.textContent = "";
+  const ta = el("textarea", "pText");
+  ta.value = msg.text;
+  ta.rows = 3;
+  const row = el("div", "pRow");
+  const save = el("button", "primary", "Сохранить и переписать");
+  const cancel = el("button", "mini", "отмена");
+  cancel.addEventListener("click", () => renderThread());
+  save.addEventListener("click", async () => {
+    const text = ta.value.trim();
+    if (text.length < 2) return ta.focus();
+    save.disabled = true;
+    try {
+      await studioCall("/api/studio/edit", { id: msg.id, text });
+      await studioCall("/api/studio/propose", { text });
+    } catch (err) {
+      $("#studioInfo").textContent = err.message;
+      save.disabled = false;
+    }
+  });
+  row.append(save, cancel);
+  wrap.append(ta, row);
+  ta.focus();
+}
+
+async function truncateAt(msg) {
+  if (!confirm("Удалить это сообщение и всё, что после него? Картинки останутся в файлах.")) return;
+  try {
+    await studioCall("/api/studio/truncate", { id: msg.id });
+  } catch (err) {
+    $("#studioInfo").textContent = err.message;
+  }
+}
+
 function proposalCard(msg) {
   const card = el("div", "proposal");
-  if (msg.why) card.append(el("div", "why", "Понял так: " + msg.why));
+
+  if (msg.reasoning || msg.why) {
+    const d = document.createElement("details");
+    d.className = "reasoning";
+    const s = document.createElement("summary");
+    s.textContent = "размышления художника";
+    d.append(s);
+    if (msg.why) d.append(el("div", "why", msg.why));
+    if (msg.reasoning) d.append(el("div", "why", msg.reasoning));
+    const spend = el("div", "meta");
+    spend.append(el("span", null, `$ ${(msg.cost || 0).toFixed(4)}`), el("span", null, `${((msg.ms || 0) / 1000).toFixed(1)} с`));
+    d.append(spend);
+    card.append(d);
+  }
 
   const ta = el("textarea", "pText");
   ta.value = msg.prompt;
@@ -267,10 +354,9 @@ function proposalCard(msg) {
     aspect.append(o);
   }
   aspect.value = msg.aspectRatio ?? "1:1";
-
   row.append(model, aspect);
 
-  const refId = lastResultId();
+  const refId = msg.ref ?? lastResultId();
   let refBox = null;
   if (refId) {
     const lab = el("label", "chk");
@@ -282,13 +368,18 @@ function proposalCard(msg) {
   }
 
   const go = el("button", "primary", "Отправить");
-  go.addEventListener("click", () => submitProposal(msg, { prompt: ta.value.trim(), model: model.value, aspectRatio: aspect.value, referenceId: refBox?.checked ? refId : null }, go));
-
-  const alt = el("button", "mini", "ещё вариант");
-  alt.addEventListener("click", () => proposeAgain(msg));
-
-  row.append(go, alt);
+  go.addEventListener("click", () =>
+    submitProposal(msg, { prompt: ta.value.trim(), model: model.value, aspectRatio: aspect.value, referenceId: refBox?.checked ? refId : null }, go)
+  );
+  row.append(go);
   card.append(row);
+
+  card.append(
+    actionsRow([
+      smallBtn("другой промт", "Переписать заново тем же запросом", () => anotherProposal(msg)),
+      smallBtn("удалить", "Убрать предложение и всё после него", () => truncateAt(msg)),
+    ])
+  );
   return card;
 }
 
@@ -298,8 +389,16 @@ function resultCard(msg) {
   img.src = `/studio/${msg.file}?v=${msg.imageId}`;
   img.loading = "lazy";
   img.alt = msg.text?.slice(0, 60) ?? "картинка";
+  img.addEventListener("click", () => window.open(`/studio/${msg.file}`, "_blank"));
+  img.style.cursor = "zoom-in";
   card.append(img);
-  card.append(el("div", "prompt", msg.text ?? ""));
+
+  const d = document.createElement("details");
+  d.className = "reasoning";
+  const s = document.createElement("summary");
+  s.textContent = "промт";
+  d.append(s, el("div", "prompt", msg.text ?? ""));
+  card.append(d);
 
   const meta = el("div", "meta");
   meta.append(
@@ -311,20 +410,25 @@ function resultCard(msg) {
   );
   card.append(meta);
 
-  const acts = el("div", "acts");
-  const again = el("button", "mini", "переделать");
-  again.addEventListener("click", () => {
-    S.studio.refItem = S.studio.models && { id: msg.imageId, file: msg.file };
-    S.studio.refData = null;
-    renderChip();
-    $("#imgPrompt").value = msg.text ?? "";
-    $("#imgPrompt").focus();
-  });
   const dl = el("a", "mini link", "скачать");
   dl.href = `/studio/${msg.file}`;
   dl.download = msg.file;
-  acts.append(again, dl);
-  card.append(acts);
+
+  card.append(
+    actionsRow([
+      smallBtn("ещё вариант", "Нарисовать заново с этим же промтом", () => regenerate(msg)),
+      smallBtn("править", "Взять как референс и дописать пожелания", () => {
+        S.studio.refItem = { id: msg.imageId, file: msg.file };
+        S.studio.refData = null;
+        renderChip();
+        $("#imgPrompt").value = "";
+        $("#imgPrompt").placeholder = "Что поправить в этой картинке?";
+        $("#imgPrompt").focus();
+      }),
+      smallBtn("удалить", "Убрать картинку из чата и откатиться", () => truncateAt(msg)),
+      dl,
+    ])
+  );
   return card;
 }
 
@@ -359,9 +463,8 @@ async function sendStudio() {
   const direct = $("#imgDirect").checked;
   const btn = $("#imgSend");
   btn.disabled = true;
-  $("#studioInfo").innerHTML = `<span class="spin"></span> ${direct ? "рисую…" : "художник пишет промт…"}`;
+  $("#studioInfo").innerHTML = `<span class="spin"></span> ${direct ? "рисую…" : "художник думает…"}`;
   try {
-    let thread;
     if (direct) {
       const body = {
         prompt: text,
@@ -370,13 +473,12 @@ async function sendStudio() {
         quality: $("#imgQuality").value,
       };
       if (S.studio.refItem?.id) body.referenceId = S.studio.refItem.id;
-      ({ thread } = await api("/api/studio/generate", { method: "POST", body: JSON.stringify(body) }));
+      await studioCall("/api/studio/generate", body);
     } else {
       const body = { text };
       if (S.studio.refItem?.id) body.referenceId = S.studio.refItem.id;
-      ({ thread } = await api("/api/studio/propose", { method: "POST", body: JSON.stringify(body) }));
+      await studioCall("/api/studio/say", body);
     }
-    S.studio.thread = thread ?? [];
     S.studio.lastText = text;
     $("#imgPrompt").value = "";
     S.studio.refItem = null;
@@ -397,30 +499,32 @@ async function submitProposal(msg, values, btn) {
   const body = { prompt: values.prompt, model: values.model, aspectRatio: values.aspectRatio, quality: msg.quality ?? "auto" };
   if (values.referenceId) body.referenceId = values.referenceId;
   try {
-    const { thread } = await api("/api/studio/generate", { method: "POST", body: JSON.stringify(body) });
-    S.studio.thread = thread ?? [];
-    renderThread();
+    await studioCall("/api/studio/generate", body);
   } catch (err) {
     $("#studioInfo").textContent = err.message;
     btn.disabled = false;
   }
 }
 
-async function proposeAgain(msg) {
-  const idx = S.studio.thread.indexOf(msg);
-  let text = S.studio.lastText;
-  for (let i = idx - 1; i >= 0; i--) {
-    if (S.studio.thread[i].role === "user") {
-      text = S.studio.thread[i].text;
-      break;
-    }
+async function regenerate(msg) {
+  $("#studioInfo").innerHTML = '<span class="spin"></span> рисую заново…';
+  try {
+    await studioCall("/api/studio/truncate", { id: msg.id });
+    const body = { prompt: msg.text, model: msg.model, aspectRatio: msg.aspectRatio, quality: msg.quality };
+    if (msg.ref) body.referenceId = msg.ref;
+    await studioCall("/api/studio/generate", body);
+  } catch (err) {
+    $("#studioInfo").textContent = err.message;
   }
+}
+
+async function anotherProposal(msg) {
+  const text = textBefore(msg);
   if (!text) return;
   $("#studioInfo").innerHTML = '<span class="spin"></span> художник думает…';
   try {
-    const { thread } = await api("/api/studio/propose", { method: "POST", body: JSON.stringify({ text }) });
-    S.studio.thread = thread ?? [];
-    renderThread();
+    await studioCall("/api/studio/truncate", { id: msg.id });
+    await studioCall("/api/studio/propose", { text });
   } catch (err) {
     $("#studioInfo").textContent = err.message;
   }
@@ -1715,6 +1819,16 @@ $("#askInput").addEventListener("keydown", (e) => {
 });
 
 $("#imgSend").addEventListener("click", sendStudio);
+$("#studioClear").addEventListener("click", async () => {
+  if (!confirm("Очистить чат? Картинки останутся в файлах, история переписки пропадёт.")) return;
+  try {
+    const { thread } = await api("/api/studio/clear", { method: "POST" });
+    S.studio.thread = thread ?? [];
+    renderThread();
+  } catch (err) {
+    $("#studioInfo").textContent = err.message;
+  }
+});
 $("#imgPrompt").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
@@ -1725,10 +1839,18 @@ $("#imgFile").addEventListener("change", (e) => {
   const file = e.target.files?.[0];
   if (!file) return;
   const reader = new FileReader();
-  reader.onload = () => {
-    S.studio.refData = String(reader.result);
-    S.studio.refItem = null;
-    renderChip();
+  reader.onload = async () => {
+    $("#studioInfo").innerHTML = '<span class="spin"></span> загружаю…';
+    try {
+      const { item } = await api("/api/studio/upload", { method: "POST", body: JSON.stringify({ data: String(reader.result) }) });
+      S.studio.refItem = item;
+      S.studio.refData = null;
+      renderChip();
+      $("#studioInfo").textContent = "референс прикреплён";
+      $("#imgPrompt").placeholder = "Что сделать с этой картинкой? Например: «сделай её в стиле гравюры»";
+    } catch (err) {
+      $("#studioInfo").textContent = err.message;
+    }
   };
   reader.readAsDataURL(file);
   e.target.value = "";

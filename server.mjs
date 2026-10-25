@@ -652,45 +652,74 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { thread: studio.threadList(80) });
     }
 
+    if (pathname === "/api/studio/say" && req.method === "POST") {
+      const body = await readBody(req, 14_000_000);
+      const text = String(body.text ?? "").trim();
+      if (text.length < 2) return json(res, 400, { error: "Пустой запрос" });
+      studio.threadAdd({ role: "user", text, ref: body.referenceId ?? null });
+      const result = await makeProposal(text, body.referenceId ?? null);
+      if (result.error) return json(res, 502, { error: result.error, thread: studio.threadList(80) });
+      return json(res, 200, { proposal: result.proposal, thread: studio.threadList(80) });
+    }
+
+    if (pathname === "/api/studio/upload" && req.method === "POST") {
+      const body = await readBody(req, 14_000_000);
+      const data = String(body.data ?? "");
+      const m = data.match(/^data:(image\/[\w.+-]+);base64,(.+)$/i);
+      if (!m) return json(res, 400, { error: "Нужна картинка в формате data URL" });
+      const item = studio.add({
+        prompt: "загруженный референс",
+        model: "upload",
+        aspectRatio: null,
+        quality: null,
+        mediaType: m[1],
+        b64: m[2],
+        cost: 0,
+        ms: 0,
+        refId: null,
+      });
+      item.uploaded = true;
+      studio.save();
+      return json(res, 200, { item });
+    }
+
     if (pathname === "/api/studio/propose" && req.method === "POST") {
       const body = await readBody(req);
       const text = String(body.text ?? "").trim();
       if (text.length < 2) return json(res, 400, { error: "Пустой запрос" });
-      if (isMock()) return json(res, 502, { error: "MOCK-режим: художник не работает без ключа" });
+      const result = await makeProposal(text);
+      if (result.error) return json(res, 502, { error: result.error, thread: studio.threadList(80) });
+      return json(res, 200, { proposal: result.proposal, thread: studio.threadList(80) });
+    }
 
-      studio.threadAdd({ role: "user", text, ref: body.referenceId ?? null });
-      const models = await imageModels().catch(() => []);
-      const agent = engine.agent("artist");
-      // только «обычные» text-to-image модели: векторные и редакторы требуют референс и падают на чистом промте
-      const blocked = /(vector|krea|edit|upscal|inpaint)/i;
-      const list = models
-        .map((m) => m.id)
-        .filter((id) => !blocked.test(id))
-        .slice(0, 40)
-        .join(", ");
-
+    if (pathname === "/api/studio/edit" && req.method === "POST") {
+      const body = await readBody(req);
+      const id = String(body.id ?? "");
+      const text = String(body.text ?? "").trim();
+      if (!id) return json(res, 400, { error: "Не указано сообщение" });
+      if (text.length < 2) return json(res, 400, { error: "Пустой текст" });
       try {
-        const out = await chat({
-          model: agent.model,
-          temperature: Number(agent.temperature ?? 0.4),
-          maxTokens: 900,
-          system: agent.prompt,
-          user: `Запрос заказчика: "${text}"\n\nДоступные модели картинок: ${list}\n\nВерни СТРОГО JSON: {"prompt":"подробный промт для модели","model":"id модели из списка","aspectRatio":"1:1|16:9|9:16|4:3|3:4|3:2","quality":"auto|low|medium|high","why":"одной фразой по-русски, как ты понял задачу"}`,
-        });
-        const data = extractJson(out.text);
-        const proposal = studio.threadAdd({
-          role: "proposal",
-          prompt: String(data.prompt ?? text),
-          model: String(data.model ?? "google/gemini-3.1-flash-image"),
-          aspectRatio: String(data.aspectRatio ?? "1:1"),
-          quality: String(data.quality ?? "auto"),
-          why: String(data.why ?? ""),
-          cost: out.usage.cost,
-        });
-        return json(res, 200, { proposal, thread: studio.threadList(80) });
+        const res2 = studio.editMessage(id, { text });
+        return json(res, 200, { ...res2, thread: studio.threadList(80) });
       } catch (err) {
-        return json(res, 502, { error: String(err?.message || err) });
+        return json(res, 404, { error: String(err.message) });
       }
+    }
+
+    if (pathname === "/api/studio/truncate" && req.method === "POST") {
+      const body = await readBody(req);
+      const id = String(body.id ?? "");
+      if (!id) return json(res, 400, { error: "Не указано сообщение" });
+      try {
+        const res2 = studio.truncateFrom(id);
+        return json(res, 200, { ...res2, thread: studio.threadList(80) });
+      } catch (err) {
+        return json(res, 404, { error: String(err.message) });
+      }
+    }
+
+    if (pathname === "/api/studio/clear" && req.method === "POST") {
+      return json(res, 200, studio.clearThread());
     }
 
     if (pathname === "/api/studio/generate" && req.method === "POST") {
@@ -911,6 +940,49 @@ const server = http.createServer(async (req, res) => {
 });
 
 /* --------------------------- ассистент портала --------------------------- */
+
+/** Художник: переписывает человеческий запрос в промт и объясняет, как понял задачу. */
+async function makeProposal(text, referenceId = null) {
+  if (isMock()) return { error: "MOCK-режим: художник не работает без ключа" };
+  const refItem = referenceId ? studio.get(String(referenceId)) : null;
+  const refNote = refItem ? `\n\nЗаказчик приложил картинку-референс (${refItem.id}). Это запрос на правку: опиши в промте, что менять, а что оставить, и используй формулировки вроде "keep the composition".` : "";
+  const models = await imageModels().catch(() => []);
+  const blocked = /(vector|krea|edit|upscal|inpaint)/i;
+  const list = models
+    .map((m) => m.id)
+    .filter((id) => !blocked.test(id))
+    .slice(0, 40)
+    .join(", ");
+
+  const agent = engine.agent("artist");
+  const started = Date.now();
+  try {
+    const out = await chat({
+      model: agent.model,
+      temperature: Number(agent.temperature ?? 0.4),
+      maxTokens: 1200,
+      system: agent.prompt,
+      user: `Запрос заказчика: "${text}"${refNote}\n\nДоступные модели картинок: ${list}\n\nВерни СТРОГО JSON: {"reasoning":"2–4 предложения по-русски: как понял задачу, что важно, что исключил, почему такая модель","prompt":"подробный промт для модели","model":"id из списка","aspectRatio":"1:1|16:9|9:16|4:3|3:4|3:2","quality":"auto|low|medium|high","why":"одной фразой по-русски"}`,
+    });
+    const data = extractJson(out.text);
+    const proposal = studio.threadAdd({
+      role: "proposal",
+      prompt: String(data.prompt ?? text),
+      model: String(data.model ?? "google/gemini-3.1-flash-image"),
+      aspectRatio: String(data.aspectRatio ?? "1:1"),
+      quality: String(data.quality ?? "auto"),
+      why: String(data.why ?? ""),
+      reasoning: String(data.reasoning ?? ""),
+      ref: referenceId,
+      cost: out.usage.cost,
+      ms: Date.now() - started,
+    });
+    return { proposal };
+  } catch (err) {
+    return { error: String(err?.message || err) };
+  }
+}
+
 
 function assistantContext() {
   const stats = buildStats();
