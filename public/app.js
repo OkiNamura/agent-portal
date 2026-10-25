@@ -34,7 +34,10 @@ const S = {
   logCutoff: 0,
   metrics: null,
   studio: { thread: [], models: [], sessions: [], activeId: null, refItem: null, refData: null, lastText: "" },
+  gallery: { items: [], total: 0, cost: 0, q: "" },
+  watch: { running: false, everyMin: 10, lastRunAt: null, lastAlerts: [] },
   corner: { items: [], unread: 0, alerts: [] },
+  globalStream: null,
   diff: { runId: null, data: null, file: null },
   tab: "flow",
   view: "mockup",
@@ -68,6 +71,7 @@ const api = async (path, opts = {}) => {
 function showLogin(message = "") {
   S.authDead = true;
   closeStream();
+  closeGlobalStream();
   document.body.classList.remove("booting");
   document.body.classList.add("auth-locked");
   const screen = $("#loginScreen");
@@ -160,6 +164,7 @@ async function boot() {
     document.body.classList.remove("auth-locked");
     $("#loginScreen")?.classList.add("hidden");
     setPage("projects");
+    connectGlobalStream();
     if (S.projects[0]) await selectProject(S.projects[0].id);
     else newProjectMode();
     pollTasks();
@@ -191,12 +196,14 @@ function setPage(page) {
   $("#pageAgents").classList.toggle("hidden", page !== "agents");
   $("#pageStats").classList.toggle("hidden", page !== "stats");
   $("#pageStudio").classList.toggle("hidden", page !== "studio");
+  $("#pageGallery").classList.toggle("hidden", page !== "gallery");
   $("#pageKeys").classList.toggle("hidden", page !== "keys");
   $("#pageSearch").classList.toggle("hidden", page !== "search");
   $("#pageAssistant").classList.toggle("hidden", page !== "assistant");
   renderList();
   if (page === "stats") loadStats();
   if (page === "studio") loadStudio();
+  if (page === "gallery") loadGallery();
   if (page === "keys") loadKeys();
   if (page === "search") setTimeout(() => $("#searchInput")?.focus(), 50);
   if (page === "assistant") {
@@ -299,6 +306,26 @@ function renderList() {
       item.addEventListener("dblclick", () => renameSession(s));
       box.append(item);
     }
+    return;
+  }
+
+  if (S.page === "gallery") {
+    const head = el("div", "listHead");
+    head.append(el("span", null, "Галерея"));
+    const again = el("button", "mini", "⟳");
+    again.title = "Обновить список картинок";
+    again.addEventListener("click", () => loadGallery());
+    head.append(again);
+    box.append(head);
+    const item = el("div", "item active");
+    const txt = el("div", "txt");
+    txt.append(
+      el("div", "n", "Все изображения"),
+      el("div", "m", `${S.gallery.total} шт. · $${Number(S.gallery.cost || 0).toFixed(3)}`)
+    );
+    item.append(txt);
+    box.append(item);
+    box.append(el("div", "empty", "Фильтр по промту — сверху. Удаление доступно редактору и админу."));
     return;
   }
 
@@ -886,6 +913,95 @@ async function anotherProposal(msg) {
     await studioCall("/api/studio/propose", { text });
   } catch (err) {
     $("#studioInfo").textContent = err.message;
+  }
+}
+
+/* -------------------------------- галерея -------------------------------- */
+
+let galleryTimer = null;
+let gallerySeq = 0;
+
+async function loadGallery() {
+  const box = $("#galleryGrid");
+  if (!box) return;
+  const seq = ++gallerySeq;
+  const q = ($("#galleryFilter")?.value ?? "").trim();
+  box.textContent = "…";
+  try {
+    const data = await api(`/api/gallery?limit=300${q ? `&q=${encodeURIComponent(q)}` : ""}`);
+    if (seq !== gallerySeq) return; // пришёл ответ на старый фильтр
+    S.gallery = { items: data.items ?? [], total: data.total ?? 0, cost: data.cost ?? 0, q };
+    renderGallery();
+    renderList();
+  } catch (err) {
+    if (seq === gallerySeq) box.textContent = "Ошибка: " + err.message;
+  }
+}
+
+function renderGallery() {
+  const box = $("#galleryGrid");
+  if (!box) return;
+  box.textContent = "";
+  const { items, total, cost, q } = S.gallery;
+  const shown = items.length !== total ? `${items.length} из ${total}` : String(items.length);
+  $("#galleryInfo").textContent = `${shown} картинок · $${Number(cost || 0).toFixed(3)}`;
+
+  if (!items.length) {
+    box.append(el("div", "empty", q ? "По фильтру ничего нет." : "Картинок пока нет — сгенерируй первую в разделе «Картинки»."));
+    return;
+  }
+
+  for (const item of items) {
+    const card = el("div", "galleryCard");
+    const img = document.createElement("img");
+    img.src = item.url;
+    img.alt = (item.prompt ?? "").slice(0, 80);
+    img.loading = "lazy";
+    img.title = "Открыть в новой вкладке";
+    img.addEventListener("click", () => window.open(item.url, "_blank", "noopener"));
+    card.append(img);
+
+    const body = el("div", "gBody");
+    const prompt = el("div", "galleryPrompt", item.prompt || "без промта");
+    prompt.title = item.prompt || "";
+    const meta = el("div", "galleryMeta");
+    meta.append(
+      el("span", null, item.model ?? "—"),
+      el("span", null, `$${Number(item.cost || 0).toFixed(3)}`),
+      el("span", null, item.at ? new Date(item.at).toLocaleDateString("ru-RU") : "—")
+    );
+
+    const acts = el("div", "galleryActs");
+    const open = document.createElement("a");
+    open.className = "mini link";
+    open.textContent = "открыть";
+    open.href = item.url;
+    open.target = "_blank";
+    open.rel = "noopener";
+    acts.append(open);
+
+    if (S.role === "admin" || S.role === "editor") {
+      const del = el("button", "mini danger", "удалить");
+      del.dataset.write = "";
+      del.addEventListener("click", () => deleteGalleryItem(item, del));
+      acts.append(del);
+    }
+
+    body.append(prompt, meta, acts);
+    card.append(body);
+    box.append(card);
+  }
+}
+
+async function deleteGalleryItem(item, btn) {
+  if (!confirm(`Удалить картинку «${(item.prompt || item.file).slice(0, 60)}»?\nЗапись исчезнет из галереи, файл ${item.file} будет удалён.`)) return;
+  btn.disabled = true;
+  try {
+    await api(`/api/images/${item.id}`, { method: "DELETE" });
+    await loadGallery();
+  } catch (err) {
+    alert(err.message);
+    btn.disabled = false;
   }
 }
 
@@ -1577,6 +1693,84 @@ async function deleteAgent(a) {
 
 /* ------------------------------- stats ------------------------------- */
 
+async function renderWatchCard(box) {
+  let data;
+  try {
+    data = await api("/api/watch");
+  } catch (err) {
+    box.append(el("div", "empty", "Дежурный недоступен: " + err.message));
+    return;
+  }
+  S.watch = data;
+
+  const card = el("div", "card watchCard");
+  const head = el("div", "sectionHead");
+  head.append(el("span", null, "Дежурный"), el("span", "tag", data.running ? "работает" : "выключен"));
+  card.append(head);
+
+  const facts = el("div", "facts");
+  facts.append(
+    el("span", null, data.running ? `каждые ${data.everyMin} мин` : `интервал: ${data.everyMin} мин`),
+    el("span", null, data.lastRunAt ? `последняя проверка: ${new Date(data.lastRunAt).toLocaleString("ru-RU")}` : "ещё не проверял")
+  );
+  card.append(facts);
+
+  if (data.lastAlerts?.length) {
+    const list = el("div", "watchAlerts");
+    for (const a of data.lastAlerts.slice(0, 5)) {
+      const row = el("div", "watchAlert " + (a.level === "bad" ? "bad" : a.level === "warn" ? "warn" : ""), a.text);
+      list.append(row);
+    }
+    if (data.lastAlerts.length > 5) list.append(el("div", "dim", `… и ещё ${data.lastAlerts.length - 5}`));
+    card.append(list);
+  } else {
+    card.append(el("div", "empty", "Проблем не найдено."));
+  }
+
+  if (S.role === "admin") {
+    const controls = el("div", "watchControls");
+    const label = el("label", "label", "Интервал, минут");
+    const every = document.createElement("input");
+    every.type = "number";
+    every.min = "1";
+    every.max = "1440";
+    every.value = String(data.everyMin ?? 10);
+    every.className = "watchEvery";
+    label.append(every);
+    controls.append(label);
+
+    const toggle = el("button", data.running ? "danger" : "primary", data.running ? "выключить" : "включить");
+    toggle.dataset.write = "";
+    toggle.addEventListener("click", async () => {
+      toggle.disabled = true;
+      try {
+        if (data.running) await api("/api/watch/stop", { method: "POST" });
+        else await api("/api/watch/start", { method: "POST", body: JSON.stringify({ everyMin: Number(every.value) || 10 }) });
+        await loadStats();
+      } catch (err) {
+        alert(err.message);
+        toggle.disabled = false;
+      }
+    });
+    controls.append(toggle);
+    every.addEventListener("change", async () => {
+      if (!data.running) return;
+      try {
+        await api("/api/watch/start", { method: "POST", body: JSON.stringify({ everyMin: Number(every.value) || 10 }) });
+        await loadStats();
+      } catch (err) {
+        alert(err.message);
+      }
+    });
+    card.append(controls);
+    card.append(el("div", "hint", "Каждые N минут портал собирает алерты, пишет их в почтовый ящик и шлёт событие watch в угловой чат."));
+  } else {
+    card.append(el("div", "hint", "Включает и настраивает администратор. Алерты приходят в угловой чат."));
+  }
+
+  box.append(card);
+}
+
 async function loadStats() {
   const box = $("#statsBody");
   box.textContent = "…";
@@ -1599,6 +1793,7 @@ async function loadStats() {
     cards.id = "statsCost";
     box.append(cards);
 
+    await renderWatchCard(box);
     await renderAgentMetrics(box);
 
     if (stats.byModel.length) {
@@ -1767,6 +1962,7 @@ function clearRun() {
   $("#iterate").classList.add("hidden");
   $("#runStatus").textContent = "";
   $("#artifacts").textContent = "";
+  $("#downloadZip")?.classList.add("hidden");
   $("#preview").src = "about:blank";
   renderStages();
 }
@@ -1804,12 +2000,50 @@ function closeStream() {
   S.stream = null;
 }
 
+/* Общий поток портала: события дежурного. */
+function connectGlobalStream() {
+  closeGlobalStream();
+  if (S.authDead) return;
+  const es = new EventSource("/api/events");
+  S.globalStream = es;
+  es.addEventListener("watch", (ev) => {
+    try {
+      const data = JSON.parse(ev.data);
+      S.watch = { ...S.watch, ...data };
+      if (data.lastRunAt) {
+        const status = $("#cornerStatus");
+        if (status) status.textContent = `дежурный: ${hhmmss(data.lastRunAt)}`;
+      }
+      if (data.alerts?.length) {
+        const badge = $("#cornerBadge");
+        if (badge) badge.classList.remove("hidden");
+      }
+      pollCorner();
+    } catch {
+      /* битое событие не должно ломать страницу */
+    }
+  });
+  es.onerror = () => {
+    if (S.authDead) es.close();
+  };
+}
+
+function closeGlobalStream() {
+  if (S.globalStream) S.globalStream.close();
+  S.globalStream = null;
+}
+
 /* ------------------------------- apply ------------------------------- */
 
 function applyRun(run) {
   S.current = run;
   $("#runStatus").textContent = `${statusLabel(run.status)} · ${run.usage.calls} вызовов · $${(run.usage.cost || 0).toFixed(4)}`;
   $("#stopRun").classList.toggle("hidden", !["running", "awaiting", "awaiting_plan"].includes(run.status));
+  const zip = $("#downloadZip");
+  if (zip) {
+    zip.href = `/api/runs/${encodeURIComponent(run.id)}/export.zip`;
+    zip.classList.remove("hidden");
+  }
   $("#planTitle").textContent = run.plan ? run.plan.title : "";
   renderStages();
   renderBlocks(run);
@@ -1857,6 +2091,11 @@ function renderBlocks(run) {
     box.append(el("div", "empty", "Декомпозиция появится после первой стадии"));
     return;
   }
+  const stage = S.stages[run.stageIndex];
+  const canDecide =
+    (S.role === "admin" || S.role === "editor") &&
+    stage?.kind === "verify" &&
+    ["running", "awaiting", "interrupted", "failed"].includes(run.status);
   for (const b of run.blocks) {
     const card = el("div", "block");
     card.append(el("span", "id", b.id));
@@ -1866,10 +2105,47 @@ function renderBlocks(run) {
     if (b.files?.length) meta.push(`файлов: ${b.files.length}`);
     if (b.fixCount) meta.push(`правок: ${b.fixCount}`);
     if (b.test?.verdict) meta.push(`тест: ${b.test.verdict}`);
+    if (b.manual?.decision) meta.push(b.manual.decision === "accept" ? "принят вручную" : "возвращён вручную");
     mid.append(el("div", "g", meta.join(" · ") || b.goal || ""));
     card.append(mid, el("span", "st " + b.status, b.status));
+    if (canDecide) card.append(blockDecisionRow(run, b));
     box.append(card);
   }
+}
+
+function blockDecisionRow(run, block) {
+  const row = el("div", "blockActs");
+  const input = document.createElement("input");
+  input.placeholder = block.manual?.decision === "accept" ? "комментарий (необязательно)" : "комментарий (обязателен для «в доработку»)";
+  const ok = el("button", "okBtn", "принять");
+  const no = el("button", "noBtn", "в доработку");
+  ok.disabled = block.manual?.decision === "accept";
+  ok.title = "Принять блок: статус verified, в событиях — «принят вручную»";
+  no.title = "Вернуть блок в доработку: статус built, комментарий уйдёт в дефекты";
+  const send = async (decision) => {
+    const comment = input.value.trim();
+    if (decision === "rework" && !comment) {
+      input.focus();
+      return;
+    }
+    ok.disabled = true;
+    no.disabled = true;
+    try {
+      const { run: next } = await api(`/api/runs/${run.id}/block/${block.id}/decision`, {
+        method: "POST",
+        body: JSON.stringify({ decision, comment }),
+      });
+      applyRun(next);
+    } catch (err) {
+      pushLog({ at: new Date().toISOString(), kind: "error", message: err.message });
+      ok.disabled = block.status === "verified";
+      no.disabled = false;
+    }
+  };
+  ok.addEventListener("click", () => send("accept"));
+  no.addEventListener("click", () => send("rework"));
+  row.append(input, ok, no);
+  return row;
 }
 
 function renderGate(run) {
@@ -1898,7 +2174,12 @@ function renderGate(run) {
     const acts = el("div", "acts");
     const again = el("button", "okBtn", "Продолжить с текущей стадии");
     again.addEventListener("click", resumeRun);
-    acts.append(again);
+    const zip = document.createElement("a");
+    zip.className = "mini link";
+    zip.textContent = "Скачать ZIP";
+    zip.href = `/api/runs/${run.id}/export.zip`;
+    zip.title = "Файлы проекта, README и отчёты одним архивом";
+    acts.append(again, zip);
     box.append(head, acts);
     return;
   }
@@ -2459,7 +2740,7 @@ function renderCorner() {
   const box = $("#cornerLog");
   box.textContent = "";
   for (const m of S.corner.items.slice(-40)) {
-    const node = el("div", "cmsg " + m.from, m.text);
+    const node = el("div", "cmsg " + m.from + (m.level ? " " + m.level : ""), m.text);
     const who = m.from === "user" ? "ты" : m.from === "harness" ? "харнесс" : m.from === "assistant" ? "ассистент портала" : "портал";
     node.prepend(el("span", "who", `${who} · ${hhmmss(m.at)}`));
     box.append(node);
@@ -2616,6 +2897,17 @@ $("#askInput").addEventListener("keydown", (e) => {
 $("#searchBtn").addEventListener("click", runSearch);
 $("#searchInput").addEventListener("keydown", (e) => {
   if (e.key === "Enter") runSearch();
+});
+$("#galleryRefresh").addEventListener("click", () => loadGallery());
+$("#galleryFilter").addEventListener("input", () => {
+  clearTimeout(galleryTimer);
+  galleryTimer = setTimeout(() => loadGallery(), 220);
+});
+$("#galleryFilter").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    clearTimeout(galleryTimer);
+    loadGallery();
+  }
 });
 $("#imgSend").addEventListener("click", sendStudio);
 $("#studioClear").addEventListener("click", async () => {

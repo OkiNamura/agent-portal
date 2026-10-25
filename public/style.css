@@ -337,6 +337,45 @@ table.tbl td { padding: 7px 8px; border-bottom: 1px solid #171e28; font-family: 
 table.tbl td.name { font-family: inherit; font-size: 12.5px; }
 .bar { height: 6px; border-radius: 3px; background: var(--accent); min-width: 2px; }
 .barWrap { width: 100%; max-width: 220px; background: #171e28; border-radius: 3px; }
+/* галерея картинок */
+.galleryBar { display: flex; align-items: center; gap: 8px; padding: 0 18px 10px; }
+.galleryBar input { flex: 1; max-width: 380px; }
+.galleryGrid { flex: 1; overflow-y: auto; padding: 0 18px 24px; display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 12px; align-content: start; }
+.galleryCard { border: 1px solid var(--line); border-radius: 12px; background: var(--panel); overflow: hidden;
+  display: flex; flex-direction: column; }
+.galleryCard img { width: 100%; aspect-ratio: 1 / 1; object-fit: cover; background: #0a0d12; cursor: zoom-in; display: block; }
+.galleryCard .gBody { padding: 8px 10px 10px; display: flex; flex-direction: column; gap: 6px; }
+.galleryPrompt { font-size: 11.5px; line-height: 1.45; color: #c3cfdf; display: -webkit-box;
+  -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.galleryMeta { display: flex; gap: 8px; flex-wrap: wrap; font-family: var(--mono); font-size: 10px; color: #5f6f85; }
+.galleryActs { display: flex; gap: 6px; align-items: center; }
+.galleryActs a.mini.link { font-size: 11px; color: var(--accent); text-decoration: none; }
+a.mini.link { color: var(--accent); font-size: 11px; text-decoration: none; padding: 2px 6px; }
+a.mini.link:hover { text-decoration: underline; }
+
+/* блоки: ручное принятие и возврат в доработку */
+.blockActs { grid-column: 1 / -1; display: flex; gap: 6px; align-items: center; flex-wrap: wrap;
+  border-top: 1px dashed var(--line); padding-top: 8px; margin-top: 2px; }
+.blockActs input { flex: 1; min-width: 160px; padding: 5px 8px; font-size: 11.5px; }
+.blockActs .okBtn { background: var(--ok); border-color: var(--ok); color: #06231a; font-weight: 600;
+  padding: 4px 10px; font-size: 11px; }
+.blockActs .noBtn { border-color: #5a2a2a; color: #ffb3b3; background: #1d0f0f; padding: 4px 10px; font-size: 11px; }
+
+/* дежурный в статистике */
+.watchCard { border: 1px solid var(--line); border-radius: 14px; background: var(--panel); padding: 14px;
+  display: flex; flex-direction: column; gap: 8px; }
+.watchCard .facts { display: flex; gap: 14px; flex-wrap: wrap; font-family: var(--mono); font-size: 11px; color: #5f6f85; }
+.watchCard .sectionHead { margin-bottom: 0; }
+.watchAlerts { display: flex; flex-direction: column; gap: 5px; }
+.watchAlert { font-size: 11.5px; padding: 6px 9px; border-radius: 8px; border: 1px solid var(--line);
+  background: #0e1319; color: #a9b7c9; }
+.watchAlert.warn { border-color: #4a3a1c; background: #1a1408; color: #e8d9b8; }
+.watchAlert.bad { border-color: #5a2a2a; background: #1d0f0f; color: #ffb3b3; }
+.watchControls { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
+.watchControls .label { margin: 0; }
+.watchEvery { width: 90px; padding: 6px 9px; font-size: 12px; }
+
 /* гейт: полный просмотр согласовываемого */
 .gateTabs { display: flex; gap: 6px; flex-wrap: wrap; margin: 10px 0 8px; }
 .gateTabs button { padding: 4px 10px; font-size: 11px; font-family: var(--mono); background: #1b1509; border-color: #4a3a1c; color: #e8d9b8; }

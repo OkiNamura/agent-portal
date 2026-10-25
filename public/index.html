@@ -48,6 +48,7 @@
     <button data-page="projects" class="active"><span class="ico">▣</span><span>Проекты</span></button>
     <button data-page="agents"><span class="ico">◈</span><span>Агенты</span></button>
     <button data-page="studio"><span class="ico">✷</span><span>Картинки</span></button>
+    <button data-page="gallery"><span class="ico">▦</span><span>Галерея</span></button>
     <button data-page="stats"><span class="ico">▤</span><span>Статистика</span></button>
     <button data-page="keys"><span class="ico">⚿</span><span>Ключи</span></button>
     <button data-page="search"><span class="ico">⌕</span><span>Поиск</span></button>
@@ -68,6 +69,7 @@
         <button data-tab="files">Файлы</button>
         <button data-tab="diff">Изменения</button>
         <span class="spacer"></span>
+        <a id="downloadZip" class="mini link hidden" href="#" title="Скачать файлы проекта и отчёты одним архивом">Скачать ZIP</a>
         <button id="stopRun" class="mini danger hidden" data-write>■ Остановить</button>
         <span id="runStatus" class="runStatus"></span>
       </nav>
@@ -189,6 +191,21 @@
           <button id="imgSend" class="primary">Художник</button>
         </div>
       </div>
+    </div>
+
+    <!-- ГАЛЕРЕЯ -->
+    <div id="pageGallery" class="page hidden">
+      <div class="pageHead">
+        <h1>Галерея</h1>
+        <div class="dim">Все картинки студии: превью, промт, модель и цена. «Удалить» убирает запись из индекса и файл из studio/.</div>
+      </div>
+      <div class="galleryBar">
+        <input id="galleryFilter" placeholder="Фильтр по тексту промта…" />
+        <button id="galleryRefresh" class="mini">обновить</button>
+        <span class="spacer"></span>
+        <span id="galleryInfo" class="dim"></span>
+      </div>
+      <div id="galleryGrid" class="galleryGrid"></div>
     </div>
 
     <!-- СТАТИСТИКА -->

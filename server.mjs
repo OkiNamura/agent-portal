@@ -15,6 +15,7 @@ import { agentMetrics, verdictSummary } from "./lib/metrics.mjs";
 import { Mailbox } from "./lib/mailbox.mjs";
 import { collectAlerts } from "./lib/watch.mjs";
 import { Studio, generateImage, listImageModels } from "./lib/studio.mjs";
+import { buildProjectZip } from "./lib/zip-pack.mjs";
 import { Keys, PRESETS } from "./lib/keys.mjs";
 import {
   SESSION_COOKIE,
@@ -137,6 +138,27 @@ const keys = new Keys(ROOT);
 const engine = new Engine({ store, config, bus, keys });
 engine.spendProvider = keySpendFromLogs;
 
+/**
+ * Ручной возврат блока: комментарий заказчика кладём в block.userDefects,
+ * а здесь дописываем его в промт следующего fix-вызова. Сам engine.mjs не
+ * трогаем — обёртка живёт только в портале и не меняет остальные вызовы.
+ */
+const engineCall = engine.call.bind(engine);
+engine.call = async function callWithUserDefects(run, agent, opts) {
+  const userDefects = opts?.meta?.block?.userDefects ?? [];
+  if (opts?.kind === "fix" && userDefects.length) {
+    const extra = userDefects
+      .slice(-5)
+      .map((d, i) => `${i + 1}. [${d.severity ?? "major"}] ${d.where ?? "замечание заказчика"}: ${d.what}`)
+      .join("\n");
+    return engineCall(run, agent, {
+      ...opts,
+      user: `${opts.user}\n\nЗамечания заказчика из ручного возврата (обязательны к исправлению):\n${extra}`,
+    });
+  }
+  return engineCall(run, agent, opts);
+};
+
 /** Ключ из настроек должен включать LIVE, даже если в .env его нет. */
 function syncKeyToEnv() {
   const k = keys.resolve(null);
@@ -147,6 +169,9 @@ syncKeyToEnv();
 const mailbox = new Mailbox(ROOT);
 const studio = new Studio(ROOT);
 let harness = readJson(path.join(CONFIG_DIR, "harness.json"));
+
+/* ---------- дежурный: интервал в памяти процесса, ничего не пишем в конфиг ---------- */
+const watch = { running: false, everyMin: 10, lastRunAt: null, lastAlerts: [], timer: null };
 
 /* ---------- что будит Харнесса: события портала → почтовый ящик ---------- */
 bus.on("event", ({ runId, entry }) => {
@@ -257,6 +282,8 @@ function snapshot(run) {
       status: b.status,
       acceptance: b.acceptance,
       deps: b.deps,
+      manual: b.manual ?? null,
+      userDefects: (b.userDefects ?? []).length,
       test: b.test ? { verdict: b.test.verdict, summary: b.test.summary, defects: b.test.defects, round: b.test.round } : null,
       fixCount: b.fixes?.length ?? 0,
       files: (b.files ?? []).map((f) => f.path),
@@ -284,6 +311,76 @@ function allRuns() {
     }
   }
   return out;
+}
+
+/** Один и тот же список алертов для /api/alerts и для дежурного. */
+function collectPortalAlerts() {
+  const runs = allRuns();
+  return collectAlerts({
+    runs,
+    metrics: { agents: agentMetrics(runs) },
+    harness,
+    projects: projects.list(),
+    stages: config.pipeline.stages,
+  });
+}
+
+function watchSnapshot() {
+  return {
+    running: watch.running,
+    everyMin: watch.everyMin,
+    lastRunAt: watch.lastRunAt,
+    lastAlerts: watch.lastAlerts,
+  };
+}
+
+/** Один круг дежурного: алерты → mailbox (без повторов) + SSE-событие watch. */
+function runWatchCheck() {
+  let alerts = [];
+  try {
+    alerts = collectPortalAlerts();
+  } catch (err) {
+    console.error("[watch]", String(err?.message || err));
+  }
+
+  const known = new Set(mailbox.items.filter((i) => i.kind === "watch").map((i) => i.text));
+  const added = [];
+  for (const a of alerts) {
+    if (known.has(a.text)) continue;
+    known.add(a.text);
+    try {
+      added.push(
+        mailbox.add({
+          from: "system",
+          text: a.text,
+          kind: "watch",
+          level: a.level ?? "info",
+          runId: a.runId ?? null,
+          projectId: a.projectId ?? null,
+        })
+      );
+    } catch (err) {
+      console.error("[watch] mailbox:", String(err?.message || err));
+    }
+  }
+
+  watch.lastRunAt = new Date().toISOString();
+  watch.lastAlerts = alerts.map((a) => ({
+    level: a.level ?? "info",
+    text: a.text,
+    runId: a.runId ?? null,
+    projectId: a.projectId ?? null,
+  }));
+
+  bus.emit("watch", { ...watchSnapshot(), added: added.length, lastAdded: added.slice(-5) });
+  return added.length;
+}
+
+function stopWatch() {
+  if (watch.timer) clearInterval(watch.timer);
+  watch.timer = null;
+  watch.running = false;
+  return watchSnapshot();
 }
 
 /** Сколько потратил конкретный ключ за сегодня — считаем по журналам, а не по памяти. */
@@ -362,6 +459,39 @@ function buildStats() {
     projects: byProject.sort((a, b) => b.cost - a.cost),
     projectsCount: projects.list().length,
   };
+}
+
+/** Текущая стадия прогона с учётом выключенных стадий пайплайна. */
+function currentStage(run) {
+  const stages = config.pipeline.stages.filter((s) => s.enabled !== false);
+  return stages[run?.stageIndex ?? -1] ?? null;
+}
+
+/** Ручные решения по блокам доступны только на стадии «Проверка». */
+function inVerification(run) {
+  if (!run) return false;
+  if (["done", "cancelled"].includes(run.status)) return false;
+  return currentStage(run)?.kind === "verify" || run.awaiting?.stageId === "verify";
+}
+
+/**
+ * Все блоки приняты вручную → прогон должен завершиться.
+ * Не дублируем завершение: выставляем stageIndex за последнюю стадию и отдаём
+ * прогон обычному engine.tick, где уже есть ветка `stageIndex >= stages.length`.
+ */
+async function completeIfAllBlocksAccepted(run) {
+  if (!run.blocks?.length) return false;
+  // Завершаем только когда КАЖДЫЙ блок принят именно вручную: авто-verified
+  // ещё не значит, что заказчик посмотрел блок на гейте.
+  if (run.blocks.some((b) => b.status !== "verified" || b.manual?.decision !== "accept")) return false;
+  const stages = config.pipeline.stages.filter((s) => s.enabled !== false);
+  run.awaiting = null;
+  run.cancelled = false;
+  run.stageIndex = stages.length;
+  run.status = "running";
+  store.save(run);
+  await engine.start(run);
+  return run.status === "done";
 }
 
 function withRuns(project) {
@@ -525,6 +655,25 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (deny(res, user.role, method, pathname)) return;
+
+    /* ---------- общий поток: сейчас это события дежурного ---------- */
+    if (pathname === "/api/events" && method === "GET") {
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no",
+      });
+      res.write(`event: hello\ndata: ${JSON.stringify({ watch: watchSnapshot() })}\n\n`);
+      const onWatch = (payload) => res.write(`event: watch\ndata: ${JSON.stringify(payload)}\n\n`);
+      bus.on("watch", onWatch);
+      const ping = setInterval(() => res.write(": ping\n\n"), 20_000);
+      req.on("close", () => {
+        clearInterval(ping);
+        bus.off("watch", onWatch);
+      });
+      return;
+    }
 
     /* --------------------------- пользователи (admin) --------------------------- */
 
@@ -851,16 +1000,34 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (pathname === "/api/alerts" && req.method === "GET") {
-      const runs = allRuns();
-      return json(res, 200, {
-        alerts: collectAlerts({
-          runs,
-          metrics: { agents: agentMetrics(runs) },
-          harness,
-          projects: projects.list(),
-          stages: config.pipeline.stages,
-        }),
-      });
+      return json(res, 200, { alerts: collectPortalAlerts() });
+    }
+
+    /* ------------------------------ дежурный ------------------------------ */
+
+    if (pathname === "/api/watch" && method === "GET") {
+      return json(res, 200, watchSnapshot());
+    }
+
+    if (pathname === "/api/watch/start" && method === "POST") {
+      if (user.role !== "admin") return json(res, 403, { error: "дежурного включает администратор" });
+      const body = await readBody(req).catch(() => ({}));
+      const raw = Number(body.everyMin ?? watch.everyMin);
+      // минимум 1 минута; нечисловое значение — текущий интервал
+      const base = Number.isFinite(raw) ? Math.floor(raw) : watch.everyMin;
+      const everyMin = Math.min(1440, Math.max(1, base));
+      watch.everyMin = everyMin;
+      if (watch.timer) clearInterval(watch.timer);
+      watch.running = true;
+      runWatchCheck(); // первый круг сразу — иначе непонятно, жив ли дежурный
+      watch.timer = setInterval(runWatchCheck, everyMin * 60_000);
+      watch.timer.unref?.();
+      return json(res, 200, watchSnapshot());
+    }
+
+    if (pathname === "/api/watch/stop" && method === "POST") {
+      if (user.role !== "admin") return json(res, 403, { error: "дежурного выключает администратор" });
+      return json(res, 200, stopWatch());
     }
 
     if (pathname === "/api/mailbox" && req.method === "GET") {
@@ -1283,6 +1450,50 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    /* ------------------------------ галерея ------------------------------ */
+
+    if (pathname === "/api/gallery" && method === "GET") {
+      const q = String(url.searchParams.get("q") ?? "").trim().toLowerCase();
+      const raw = Number(url.searchParams.get("limit") ?? 200);
+      const limit = Math.max(1, Math.min(Number.isFinite(raw) ? Math.floor(raw) : 200, 300));
+      const all = studio.list(300); // индекс студии и так не длиннее 300 записей
+      const filtered = q ? all.filter((i) => `${i.prompt ?? ""} ${i.model ?? ""}`.toLowerCase().includes(q)) : all;
+      const items = filtered.slice(0, limit).map((i) => ({
+        id: i.id,
+        file: i.file,
+        prompt: i.prompt ?? "",
+        model: i.model ?? null,
+        cost: Number(i.cost ?? 0),
+        at: i.at ?? null,
+        url: `/studio/${i.file}`,
+        mediaType: i.mediaType ?? null,
+        aspectRatio: i.aspectRatio ?? null,
+      }));
+      return json(res, 200, {
+        items,
+        total: filtered.length,
+        cost: filtered.reduce((sum, i) => sum + Number(i.cost ?? 0), 0),
+        limit,
+      });
+    }
+
+    const im = pathname.match(/^\/api\/images\/([\w-]+)$/);
+    if (im && method === "DELETE") {
+      const item = studio.get(im[1]);
+      if (!item) return json(res, 404, { error: "Картинка не найдена" });
+      const file = path.resolve(studio.filePath(item));
+      const dir = path.resolve(studio.dir) + path.sep;
+      if (!file.startsWith(dir)) return json(res, 403, { error: "forbidden" });
+      try {
+        if (fs.existsSync(file)) fs.rmSync(file, { force: true });
+      } catch (err) {
+        return json(res, 409, { error: `Файл не удалился: ${String(err?.message || err)}` });
+      }
+      studio.items = studio.items.filter((i) => i.id !== item.id);
+      studio.save();
+      return json(res, 200, { ok: true, id: item.id, removed: item.file });
+    }
+
     if (pathname === "/api/assistant" && req.method === "POST") {
       const body = await readBody(req);
       const question = String(body.question ?? "").trim();
@@ -1291,7 +1502,80 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, answer);
     }
 
-    const m = pathname.match(/^\/api\/runs\/([\w.-]+)(?:\/(events|approve|cancel|resume|artifact|plan|diff))?$/);
+    /* ---------- ручное решение по блоку на стадии проверки ---------- */
+
+    const bm = pathname.match(/^\/api\/runs\/([\w.-]+)\/block\/([\w-]+)\/decision$/);
+    if (bm && method === "POST") {
+      const [, runId, blockId] = bm;
+      let run;
+      try {
+        run = store.load(runId);
+      } catch {
+        return json(res, 404, { error: "Прогон не найден" });
+      }
+      if (!inVerification(run)) {
+        return json(res, 409, { error: "Решения по блокам доступны только на стадии проверки" });
+      }
+      const body = await readBody(req);
+      const decision = String(body.decision ?? "");
+      if (!["accept", "rework"].includes(decision)) return json(res, 400, { error: "decision: accept или rework" });
+      const block = (run.blocks ?? []).find((b) => b.id === blockId);
+      if (!block) return json(res, 404, { error: `Блок ${blockId} не найден` });
+      const comment = String(body.comment ?? "").trim().slice(0, 2000);
+      const at = new Date().toISOString();
+      block.history = block.history ?? [];
+
+      if (decision === "accept") {
+        block.status = "verified";
+        block.manual = { decision: "accept", at, by: user.login, comment };
+        block.history.push({ at, action: "manual-accept", notes: comment });
+        engine.emit(run, "approve", `Блок ${block.id} принят вручную${comment ? `: ${comment}` : ""}`, {
+          block: block.id,
+          agent: user.login,
+          manual: true,
+        });
+        const completed = await completeIfAllBlocksAccepted(run);
+        if (!completed) {
+          store.save(run);
+          bus.emit("state", { runId: run.id, run });
+        }
+        return json(res, 200, { run: snapshot(run), completed });
+      }
+
+      if (!comment) return json(res, 400, { error: "Для возврата в доработку нужен комментарий — что поправить" });
+      block.status = "built";
+      block.manual = { decision: "rework", at, by: user.login, comment };
+      const defect = {
+        severity: "major",
+        where: "замечание заказчика",
+        what: comment,
+        criterion: "требование заказчика",
+        source: "user",
+        at,
+      };
+      // Пользовательские дефекты копим отдельно: следующий fix-вызов получит их
+      // даже после того, как тестировщик перезапишет block.test.defects.
+      block.userDefects = [...(block.userDefects ?? []), defect].slice(-5);
+      block.test = block.test ?? {};
+      block.test.verdict = "fail";
+      block.test.defects = [...(block.test.defects ?? []), defect];
+      block.history.push({ at, action: "manual-rework", notes: comment });
+      // Существующий механизм feedback для стадии build — на случай повторной сборки.
+      run.stageMeta = run.stageMeta ?? {};
+      const prev = run.stageMeta.build?.feedback ?? "";
+      run.stageMeta.build = { feedback: [prev, comment].filter(Boolean).join("\n") };
+      engine.emit(run, "reject", `Блок ${block.id} возвращён в доработку: ${comment}`, {
+        block: block.id,
+        agent: user.login,
+        manual: true,
+        comment,
+      });
+      store.save(run);
+      bus.emit("state", { runId: run.id, run });
+      return json(res, 200, { run: snapshot(run), completed: false });
+    }
+
+    const m = pathname.match(/^\/api\/runs\/([\w.-]+)(?:\/(events|approve|cancel|resume|artifact|plan|diff|export\.zip))?$/);
     if (m) {
       const [, id, action] = m;
       const run = store.load(id);
@@ -1326,6 +1610,23 @@ const server = http.createServer(async (req, res) => {
           bus.off("state", onState);
         });
         return;
+      }
+
+      if (action === "export.zip" && req.method === "GET") {
+        try {
+          const project = projects.byRun(run.id);
+          const { buffer, name, ascii } = buildProjectZip({ run, store, project });
+          const encoded = encodeURIComponent(name).replace(/['()]/g, (c) => (c === "'" ? "%27" : c === "(" ? "%28" : "%29"));
+          res.writeHead(200, {
+            "Content-Type": "application/zip",
+            "Content-Length": buffer.length,
+            "Content-Disposition": `attachment; filename="${ascii}"; filename*=UTF-8''${encoded}`,
+            "Cache-Control": "no-store",
+          });
+          return res.end(buffer);
+        } catch (err) {
+          return json(res, 500, { error: `ZIP не собрался: ${String(err?.message || err)}` });
+        }
       }
 
       if (action === "approve" && req.method === "POST") {
@@ -1554,7 +1855,12 @@ server.listen(PORT, "127.0.0.1", () => {
 for (const sig of ["SIGINT", "SIGTERM"]) {
   process.on(sig, () => {
     console.log("\nОстановка сервера…");
+    if (watch.timer) clearInterval(watch.timer);
+    watch.timer = null;
+    watch.running = false;
     server.close(() => process.exit(0));
+    // SSE-потоки (прогоны и дежурный) держат соединения — иначе процесс не выйдет
+    server.closeAllConnections?.();
   });
 }
 
