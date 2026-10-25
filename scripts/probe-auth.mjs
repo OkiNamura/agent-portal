@@ -208,7 +208,7 @@ try {
     body: { task: "Проверка роли viewer: запуск должен быть запрещён" },
   });
   check("viewer POST /api/runs → 403", viewerRuns.status === 403, `статус ${viewerRuns.status} · ${JSON.stringify(viewerRuns.data)}`);
-  const viewerKeys = await request("/api/keys", { method: "POST", cookie: viewerLogin.cookie, body: { label: "x", key: "sk-or-v1-000000000000000000000000" } });
+  const viewerKeys = await request("/api/keys", { method: "POST", cookie: viewerLogin.cookie, body: { label: "x", key: "sk-or-v1-test" } });
   check("viewer POST /api/keys → 403", viewerKeys.status === 403, `статус ${viewerKeys.status}`);
 
   /* 5. editor — прогоны можно, ключи нельзя, проекты удалять нельзя */
@@ -221,7 +221,7 @@ try {
   });
   check("editor POST /api/runs → 201", editorRuns.status === 201, `статус ${editorRuns.status} · ${JSON.stringify(editorRuns.data?.run?.id ?? editorRuns.data)}`);
   const editorRunId = editorRuns.data?.run?.id;
-  const editorKeys = await request("/api/keys", { method: "POST", cookie: editorLogin.cookie, body: { label: "x", key: "sk-or-v1-000000000000000000000000" } });
+  const editorKeys = await request("/api/keys", { method: "POST", cookie: editorLogin.cookie, body: { label: "x", key: "sk-or-v1-test" } });
   check("editor POST /api/keys → 403", editorKeys.status === 403, `статус ${editorKeys.status}`);
   const editorProject = await request("/api/projects", { method: "POST", cookie: editorLogin.cookie, body: { name: "probe", task: "Проект для проверки запрета удаления" } });
   check("editor POST /api/projects → 201", editorProject.status === 201, `статус ${editorProject.status}`);
@@ -267,7 +267,7 @@ try {
   const adminKeys = await request("/api/keys", {
     method: "POST",
     cookie: adminLogin.cookie,
-    body: { label: "probe-auth", key: "sk-or-v1-0000000000000000000000000000000000000000000000", limitDaily: 0 },
+    body: { label: "probe-auth", key: "sk-or-v1-test", limitDaily: 0 },
   });
   check("admin POST /api/keys → 200", adminKeys.status === 200, `статус ${adminKeys.status} · ${JSON.stringify(adminKeys.data?.error ?? "")}`);
 
