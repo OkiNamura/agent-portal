@@ -40,7 +40,11 @@ const S = {
 const api = async (path, opts = {}) => {
   const res = await fetch(path, { headers: { "Content-Type": "application/json" }, ...opts });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  if (!res.ok) {
+    const err = new Error(data.error || `HTTP ${res.status}`);
+    err.data = data;
+    throw err;
+  }
   return data;
 };
 
@@ -274,8 +278,10 @@ async function loadStudio() {
 }
 
 async function loadThread() {
-  if (!S.studio.activeId) return;
-  const { thread } = await api(`/api/studio/thread?session=${encodeURIComponent(S.studio.activeId)}`);
+  const sid = S.studio.activeId;
+  if (!sid) return;
+  const { thread } = await api(`/api/studio/thread?session=${encodeURIComponent(sid)}`);
+  if (S.studio.activeId !== sid) return; // успели переключиться — чужой ответ не применяем
   S.studio.thread = thread ?? [];
   renderThread();
 }
@@ -429,13 +435,23 @@ function docCard(msg) {
 
 /* общая обёртка для вызовов студии, чтобы не дублировать обновление треда */
 async function studioCall(path, body) {
-  const payload = { ...(body ?? {}), sessionId: S.studio.activeId };
-  const data = await api(path, { method: "POST", body: JSON.stringify(payload) });
-  if (data.thread) {
-    S.studio.thread = data.thread;
-    renderThread();
+  const sid = S.studio.activeId;
+  const payload = { ...(body ?? {}), sessionId: sid };
+  try {
+    const data = await api(path, { method: "POST", body: JSON.stringify(payload) });
+    if (data.thread && S.studio.activeId === sid) {
+      S.studio.thread = data.thread;
+      renderThread();
+    }
+    return data;
+  } catch (err) {
+    // сервер вернул тред вместе с ошибкой — показываем сохранённое сообщение, чтобы не было «невидимых»
+    if (err.data?.thread && S.studio.activeId === sid) {
+      S.studio.thread = err.data.thread;
+      renderThread();
+    }
+    throw err;
   }
-  return data;
 }
 
 function actionsRow(buttons) {
@@ -482,10 +498,15 @@ function editUserMessage(msg, wrap) {
   save.addEventListener("click", async () => {
     const text = ta.value.trim();
     if (text.length < 2) return ta.focus();
+    const idx = S.studio.thread.indexOf(msg);
+    const after = idx >= 0 ? S.studio.thread.length - idx - 1 : 0;
+    if (after > 0 && !confirm(`После этого сообщения будет удалено ${after} — они пропадут из чата. Продолжить?`)) return;
     save.disabled = true;
     try {
+      const sess = S.studio.sessions.find((s) => s.id === S.studio.activeId);
       await studioCall("/api/studio/edit", { id: msg.id, text });
-      await studioCall("/api/studio/propose", { text });
+      if (sess?.kind === "docs") await studioCall("/api/studio/doc", { text });
+      else await studioCall("/api/studio/propose", { text });
     } catch (err) {
       $("#studioInfo").textContent = err.message;
       save.disabled = false;
@@ -751,8 +772,7 @@ async function submitProposal(msg, values, btn) {
 async function regenerate(msg) {
   $("#studioInfo").innerHTML = '<span class="spin"></span> рисую заново…';
   try {
-    await studioCall("/api/studio/truncate", { id: msg.id });
-    const body = { prompt: msg.text, model: msg.model, aspectRatio: msg.aspectRatio, quality: msg.quality };
+    const body = { prompt: msg.text, model: msg.model, aspectRatio: msg.aspectRatio, quality: msg.quality, replaceId: msg.id };
     if (msg.ref) body.referenceId = msg.ref;
     await studioCall("/api/studio/generate", body);
   } catch (err) {

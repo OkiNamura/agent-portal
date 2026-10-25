@@ -1081,8 +1081,9 @@ const server = http.createServer(async (req, res) => {
             references,
           });
         } catch (err) {
-          // модель может не поддерживать параметры — один раз пробуем надёжную с минимальным набором
+          // повторяем только когда модель не приняла параметры; 401/402/таймаут не ретраим — это деньги
           if (requested === "google/gemini-3.1-flash-image") throw err;
+          if (!/\((400|422)\)/.test(String(err?.message || ""))) throw err;
           usedModel = "google/gemini-3.1-flash-image";
           out = await generateImage({
             model: usedModel,
@@ -1091,6 +1092,14 @@ const server = http.createServer(async (req, res) => {
             aspectRatio: body.aspectRatio ? String(body.aspectRatio) : undefined,
             references,
           });
+        }
+        // «ещё вариант»: сначала рисуем, и только потом убираем старое — при ошибке картинка остаётся
+        if (body.replaceId) {
+          try {
+            studio.truncateFrom(String(body.replaceId), body.sessionId ?? undefined);
+          } catch {
+            /* сообщение уже удалено */
+          }
         }
         const item = studio.add({
           prompt,
