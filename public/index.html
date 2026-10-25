@@ -11,12 +11,34 @@
 <meta name="description" content="Локальный портал оркестрации: проекты, агенты, гейты, макет и код по спецификациям" />
 <link rel="stylesheet" href="style.css" />
 </head>
-<body>
+<body class="booting">
+
+<div id="loginScreen" class="loginScreen hidden">
+  <form id="loginForm" class="loginCard" autocomplete="on">
+    <div class="brand"><span class="logo">◈</span><span>AGENT&nbsp;PORTAL</span></div>
+    <div class="loginHint">Вход в портал</div>
+    <label class="label">Логин
+      <input id="loginLogin" name="login" autocomplete="username" required autofocus />
+    </label>
+    <label class="label">Пароль
+      <input id="loginPassword" name="password" type="password" autocomplete="current-password" required />
+    </label>
+    <div id="loginError" class="loginError hidden"></div>
+    <button id="loginSubmit" class="primary" type="submit">Войти</button>
+    <div class="loginNote">Пароль администратора печатается в консоли сервера при первом запуске.</div>
+  </form>
+</div>
+
 <header class="top">
   <div class="brand"><span class="logo">◈</span><span>AGENT&nbsp;PORTAL</span></div>
   <div class="meta">
     <span id="modeBadge" class="badge">…</span>
     <span class="cost" title="Потрачено на все прогоны">$<span id="cost">0.0000</span></span>
+    <span id="userBadge" class="userBadge hidden">
+      <span id="userLogin" class="userLogin"></span>
+      <span id="userRole" class="tag"></span>
+      <button id="logoutBtn" class="mini" type="button" title="Завершить сессию">выйти</button>
+    </span>
   </div>
 </header>
 
@@ -46,7 +68,7 @@
         <button data-tab="files">Файлы</button>
         <button data-tab="diff">Изменения</button>
         <span class="spacer"></span>
-        <button id="stopRun" class="mini danger hidden">■ Остановить</button>
+        <button id="stopRun" class="mini danger hidden" data-write>■ Остановить</button>
         <span id="runStatus" class="runStatus"></span>
       </nav>
       <div class="tabBody">
@@ -56,7 +78,7 @@
             <input id="projectName" placeholder="Название проекта" />
             <textarea id="task" rows="3" placeholder="Что нужно сделать? Опиши результат, а не способ."></textarea>
             <div class="row">
-              <button id="start" class="primary">Запустить каскад</button>
+              <button id="start" class="primary" data-write>Запустить каскад</button>
               <span id="hint" class="hint">Декомпозиция → спеки → макет → код → проверка.</span>
             </div>
           </div>
@@ -65,7 +87,7 @@
             <div class="iterHead"><b>Доработка</b><span class="dim">проект уже есть — агенты правят его, а не начинают с нуля</span></div>
             <div class="row">
               <input id="changeInput" placeholder="Что изменить?" />
-              <button id="iterateBtn" class="primary">Доработать</button>
+              <button id="iterateBtn" class="primary" data-write>Доработать</button>
             </div>
           </div>
           <div class="blocksWrap">

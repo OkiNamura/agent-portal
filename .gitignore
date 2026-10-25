@@ -17,3 +17,4 @@ node_modules/
 *.log
 *.tmp
 tmp-docx-test.docx
+config/users.json

@@ -16,6 +16,22 @@ import { Mailbox } from "./lib/mailbox.mjs";
 import { collectAlerts } from "./lib/watch.mjs";
 import { Studio, generateImage, listImageModels } from "./lib/studio.mjs";
 import { Keys, PRESETS } from "./lib/keys.mjs";
+import {
+  SESSION_COOKIE,
+  SESSION_MAX_AGE,
+  loadUsers,
+  verify,
+  createSession,
+  getSession,
+  dropSession,
+  requireUser,
+  deny,
+  listUsers,
+  createUser,
+  setUserPassword,
+  setUserRole,
+  removeUser,
+} from "./lib/auth.mjs";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 loadEnv(ROOT);
@@ -24,6 +40,14 @@ if (process.argv.includes("--mock")) process.env.MOCK = "1";
 const PORT = Number(process.env.PORT || 7777);
 const PUBLIC = path.join(ROOT, "public");
 const CONFIG_DIR = path.join(ROOT, "config");
+
+/* Пользователи и сессии. Первый запуск создаёт админа и печатает его пароль один раз. */
+try {
+  loadUsers();
+} catch (err) {
+  console.error(`[auth] не удалось прочитать ${path.join(CONFIG_DIR, "users.json")}: ${String(err?.message || err)}`);
+  process.exit(1);
+}
 
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -180,6 +204,11 @@ const json = (res, code, payload) => {
   });
   res.end(body);
 };
+
+/** Cookie сессии: httpOnly + SameSite=Strict, 12 часов (Max-Age 43200). */
+function sessionCookie(token, maxAge = SESSION_MAX_AGE) {
+  return `${SESSION_COOKIE}=${encodeURIComponent(token)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${maxAge}`;
+}
 
 const readBody = (req, limit = 2_000_000) =>
   new Promise((resolve, reject) => {
@@ -458,6 +487,83 @@ const server = http.createServer(async (req, res) => {
     }
     if (pathname.startsWith("/preview/")) return servePreview(res, pathname);
     if (!pathname.startsWith("/api/")) return serveStatic(req, res, pathname);
+
+    /* ------------------------------ авторизация ------------------------------ */
+
+    const method = req.method ?? "GET";
+
+    // публичные маршруты входа/выхода
+    if (pathname === "/api/login") {
+      if (method === "GET") return json(res, 200, { ok: true, login: "/api/login (POST)" });
+      if (method === "POST") {
+        const body = await readBody(req);
+        const user = verify(body.login, body.password);
+        if (!user) return json(res, 401, { error: "неверный логин или пароль" });
+        const token = createSession(user.id);
+        res.setHeader("Set-Cookie", sessionCookie(token));
+        return json(res, 200, { ok: true, user: { login: user.login, role: user.role } });
+      }
+      return json(res, 405, { error: "method not allowed" });
+    }
+
+    if (pathname === "/api/logout" && method === "POST") {
+      const token = url.searchParams.get("token");
+      const session = requireUser(req) ?? (token ? getSession(token) : null);
+      if (session) dropSession(session.token);
+      res.setHeader("Set-Cookie", sessionCookie("", 0));
+      return json(res, 200, { ok: true });
+    }
+
+    // всё остальное /api/* требует сессию; для SSE токен можно передать в ?token=
+    const isEvents = /^\/api\/runs\/[\w.-]+\/events$/.test(pathname);
+    const queryToken = isEvents && method === "GET" ? url.searchParams.get("token") : null;
+    const user = requireUser(req) ?? (queryToken ? getSession(queryToken) : null);
+    if (!user) return json(res, 401, { error: "нужен вход" });
+
+    if (pathname === "/api/me" && method === "GET") {
+      return json(res, 200, { login: user.login, role: user.role });
+    }
+
+    if (deny(res, user.role, method, pathname)) return;
+
+    /* --------------------------- пользователи (admin) --------------------------- */
+
+    if (pathname === "/api/users" && method === "GET") {
+      return json(res, 200, { users: listUsers() });
+    }
+
+    if (pathname === "/api/users" && method === "POST") {
+      const body = await readBody(req);
+      try {
+        const created = createUser({ login: body.login, password: body.password, role: body.role });
+        return json(res, 201, { user: created, users: listUsers() });
+      } catch (err) {
+        return json(res, 400, { error: String(err?.message || err) });
+      }
+    }
+
+    const um = pathname.match(/^\/api\/users\/([\w-]+)(?:\/(password|role))?$/);
+    if (um) {
+      const [, userId, action] = um;
+      try {
+        if (action === "password" && method === "POST") {
+          const body = await readBody(req);
+          setUserPassword(userId, body.password);
+          return json(res, 200, { ok: true });
+        }
+        if (action === "role" && method === "POST") {
+          const body = await readBody(req);
+          return json(res, 200, { user: setUserRole(userId, body.role), users: listUsers() });
+        }
+        if (!action && method === "DELETE") {
+          removeUser(userId);
+          return json(res, 200, { ok: true, users: listUsers() });
+        }
+      } catch (err) {
+        return json(res, 400, { error: String(err?.message || err) });
+      }
+      return json(res, 404, { error: "not found" });
+    }
 
     if (pathname === "/api/state" && req.method === "GET") {
       return json(res, 200, {
@@ -1441,6 +1547,7 @@ server.listen(PORT, "127.0.0.1", () => {
   console.log(`\n  Agent Portal  ·  http://127.0.0.1:${PORT}`);
   console.log(`  Режим: ${mode}`);
   console.log(`  Конфиг: config/agents.json, config/pipeline.json`);
+  console.log(`  Вход: /api/login · роли viewer / editor / admin`);
   console.log(`  Прогоны: runs/\n`);
 });
 

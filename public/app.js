@@ -11,6 +11,9 @@ const el = (tag, cls, text) => {
 const S = {
   mode: "mock",
   page: "projects",
+  user: null,
+  role: null,
+  authDead: false,
   agents: [],
   agentsFile: null,
   pipelineFile: null,
@@ -38,15 +41,102 @@ const S = {
 };
 
 const api = async (path, opts = {}) => {
+  const method = String(opts.method ?? "GET").toUpperCase();
+  if (S.role === "viewer" && !["GET", "HEAD"].includes(method)) {
+    throw new Error("Роль viewer: только чтение");
+  }
   const res = await fetch(path, { headers: { "Content-Type": "application/json" }, ...opts });
   const data = await res.json().catch(() => ({}));
+  if (res.status === 401) {
+    showLogin("Нужен вход — сессия истекла или её ещё нет.");
+    const err = new Error(data.error || "нужен вход");
+    err.status = 401;
+    err.data = data;
+    throw err;
+  }
   if (!res.ok) {
     const err = new Error(data.error || `HTTP ${res.status}`);
+    err.status = res.status;
     err.data = data;
     throw err;
   }
   return data;
 };
+
+/* ------------------------------- авторизация ------------------------------- */
+
+function showLogin(message = "") {
+  S.authDead = true;
+  closeStream();
+  document.body.classList.remove("booting");
+  document.body.classList.add("auth-locked");
+  const screen = $("#loginScreen");
+  if (!screen) return;
+  screen.classList.remove("hidden");
+  const err = $("#loginError");
+  if (err) {
+    err.textContent = message;
+    err.classList.toggle("hidden", !message);
+  }
+  $("#userBadge")?.classList.add("hidden");
+  setTimeout(() => $("#loginLogin")?.focus(), 40);
+}
+
+function applyRole(me) {
+  S.user = me?.login ? me : null;
+  S.role = me?.role ?? "viewer";
+  S.authDead = false;
+  document.body.dataset.role = S.role;
+  for (const role of ["viewer", "editor", "admin"]) {
+    document.body.classList.toggle(`role-${role}`, S.role === role);
+  }
+  $("#userBadge")?.classList.remove("hidden");
+  const login = $("#userLogin");
+  const role = $("#userRole");
+  if (login) login.textContent = me?.login ?? "";
+  if (role) role.textContent = ({ viewer: "только чтение", editor: "редактор", admin: "админ" })[S.role] ?? S.role;
+}
+
+async function submitLogin(event) {
+  event?.preventDefault();
+  const button = $("#loginSubmit");
+  const loginInput = $("#loginLogin");
+  const passInput = $("#loginPassword");
+  const err = $("#loginError");
+  const login = loginInput.value.trim();
+  const password = passInput.value;
+  button.disabled = true;
+  try {
+    const res = await fetch("/api/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ login, password }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      err.textContent = data.error || `HTTP ${res.status}`;
+      err.classList.remove("hidden");
+      passInput.select();
+      return;
+    }
+    // cookie уже стоит — начинаем с чистого состояния
+    window.location.reload();
+  } catch (e) {
+    err.textContent = "Сервер не ответил: " + e.message;
+    err.classList.remove("hidden");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function submitLogout() {
+  try {
+    await fetch("/api/logout", { method: "POST", headers: { "Content-Type": "application/json" } });
+  } catch {
+    /* всё равно перезагружаемся — cookie могла уже истечь */
+  }
+  window.location.reload();
+}
 
 const hhmmss = (iso) => (iso ? new Date(iso) : new Date()).toTimeString().slice(0, 8);
 const statusLabel = (s) =>
@@ -56,6 +146,8 @@ const statusLabel = (s) =>
 
 async function boot() {
   try {
+    const me = await api("/api/me");
+    applyRole(me);
     const st = await api("/api/state");
     S.mode = st.mode;
     S.agentsFile = st.agents;
@@ -64,6 +156,9 @@ async function boot() {
     S.stages = st.pipeline.stages.filter((s) => s.enabled !== false);
     S.projects = st.projects ?? [];
     renderMode(st);
+    document.body.classList.remove("booting");
+    document.body.classList.remove("auth-locked");
+    $("#loginScreen")?.classList.add("hidden");
     setPage("projects");
     if (S.projects[0]) await selectProject(S.projects[0].id);
     else newProjectMode();
@@ -74,6 +169,8 @@ async function boot() {
     setInterval(pollLogs, 6000);
     setInterval(pollCorner, 20000);
   } catch (err) {
+    if (err.status === 401) return; // форма входа уже показана в api()
+    document.body.classList.remove("booting");
     $("#runStatus").textContent = "ошибка загрузки: " + err.message;
   }
 }
@@ -132,7 +229,7 @@ function renderList() {
       const n = el("div", "n");
       n.append(dot(last?.status), el("span", null, p.name));
       txt.append(n, el("div", "m", `${p.runs?.length ?? 0} верс. · ${statusLabel(last?.status ?? "—")}`));
-      const kill = el("button", "kill", "✕");
+      const kill = el("button", "kill projectKill", "✕");
       kill.title = "Удалить проект";
       kill.addEventListener("click", (e) => {
         e.stopPropagation();
@@ -939,6 +1036,114 @@ async function loadKeys() {
   }
   table.append(tb);
   box.append(table);
+
+  // управление пользователями — только админ
+  if (S.role === "admin") box.append(await renderUsersCard());
+}
+
+async function renderUsersCard() {
+  const card = el("div", "card");
+  card.id = "usersCard";
+  card.append(el("div", "sectionTitle", "Пользователи и роли"));
+  card.append(el("div", "dim", "viewer — только чтение; editor — прогоны и настройки, кроме ключей, пользователей и удаления проектов; admin — всё."));
+
+  let users = [];
+  try {
+    ({ users } = await api("/api/users"));
+  } catch (err) {
+    card.append(el("div", "hint", "Не удалось загрузить пользователей: " + err.message));
+    return card;
+  }
+
+  const table = el("table", "tbl");
+  table.innerHTML = "<thead><tr><th>Логин</th><th>Роль</th><th>Создан</th><th>Действия</th></tr></thead>";
+  const tb = document.createElement("tbody");
+  for (const u of users) {
+    const tr = document.createElement("tr");
+    tr.append(td(u.login, "name"));
+
+    const roleCell = document.createElement("td");
+    const sel = document.createElement("select");
+    sel.className = "miniSelect";
+    for (const r of ["viewer", "editor", "admin"]) {
+      const o = document.createElement("option");
+      o.value = r;
+      o.textContent = r;
+      sel.append(o);
+    }
+    sel.value = u.role;
+    sel.addEventListener("change", async () => {
+      try {
+        await api(`/api/users/${u.id}/role`, { method: "POST", body: JSON.stringify({ role: sel.value }) });
+        await loadKeys();
+      } catch (err) {
+        alert(err.message);
+        await loadKeys();
+      }
+    });
+    roleCell.append(sel);
+    tr.append(roleCell, td(new Date(u.createdAt).toLocaleString("ru-RU")));
+
+    const acts = document.createElement("td");
+    const pass = el("button", "mini", "сменить пароль");
+    pass.addEventListener("click", async () => {
+      const next = prompt(`Новый пароль для «${u.login}» (минимум 6 символов)`);
+      if (!next) return;
+      try {
+        await api(`/api/users/${u.id}/password`, { method: "POST", body: JSON.stringify({ password: next }) });
+        alert("Пароль обновлён. Старые сессии этого пользователя закрыты.");
+      } catch (err) {
+        alert(err.message);
+      }
+    });
+    const del = el("button", "mini danger", "удалить");
+    del.addEventListener("click", async () => {
+      if (!confirm(`Удалить пользователя «${u.login}»?`)) return;
+      try {
+        await api(`/api/users/${u.id}`, { method: "DELETE" });
+        await loadKeys();
+      } catch (err) {
+        alert(err.message);
+      }
+    });
+    acts.append(pass, del);
+    tr.append(acts);
+    tb.append(tr);
+  }
+  table.append(tb);
+  card.append(table);
+
+  const form = el("div", "keyForm");
+  const login = document.createElement("input");
+  login.placeholder = "логин (латиница, 3–32)";
+  const password = document.createElement("input");
+  password.placeholder = "пароль (мин. 6)";
+  password.type = "password";
+  const role = document.createElement("select");
+  role.className = "miniSelect";
+  for (const r of ["viewer", "editor", "admin"]) {
+    const o = document.createElement("option");
+    o.value = r;
+    o.textContent = r;
+    role.append(o);
+  }
+  role.value = "editor";
+  const add = el("button", "primary", "Добавить пользователя");
+  add.addEventListener("click", async () => {
+    add.disabled = true;
+    try {
+      await api("/api/users", { method: "POST", body: JSON.stringify({ login: login.value.trim(), password: password.value, role: role.value }) });
+      await loadKeys();
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      add.disabled = false;
+    }
+  });
+  form.append(login, password, role, add);
+  card.append(form);
+  card.append(el("div", "hint", "Пароли хранятся scrypt-хешами. Пароль первого админа напечатан в консоли сервера."));
+  return card;
 }
 
 /* -------------------------------- поиск -------------------------------- */
@@ -1196,7 +1401,7 @@ function renderProjectHead() {
   const facts = el("div", "facts");
   const cost = S.runs.reduce((a, r) => a + (r.cost || 0), 0);
   facts.append(el("span", null, `версий: ${S.runs.length}`), el("span", null, `$${cost.toFixed(4)}`));
-  const del = el("button", "mini danger", "удалить проект");
+  const del = el("button", "mini danger projectKill", "удалить проект");
   del.addEventListener("click", () => deleteProject(S.project));
   facts.append(del);
   box.append(facts);
@@ -1588,6 +1793,10 @@ function connectStream(id) {
       /* ignore */
     }
   });
+  // Если сессия истекла, SSE получает 401 и молча переподключается — проверяем вход вручную.
+  es.onerror = () => {
+    api("/api/me").catch(() => {});
+  };
 }
 
 function closeStream() {
@@ -1920,6 +2129,7 @@ function pushLog(entry) {
 /* ------------------------- tasks and global logs ------------------------- */
 
 async function pollTasks() {
+  if (S.authDead) return;
   try {
     const { tasks } = await api("/api/tasks");
     const box = $("#tasks");
@@ -1945,6 +2155,7 @@ async function pollTasks() {
 }
 
 async function pollLogs() {
+  if (S.authDead) return;
   try {
     const { logs } = await api("/api/logs?limit=80");
     const box = $("#globalLog");
@@ -2230,6 +2441,7 @@ async function loadDiff(run, baseId = null) {
 /* --------------------------- угловой чат --------------------------- */
 
 async function pollCorner() {
+  if (S.authDead) return;
   try {
     const [mb, al] = await Promise.all([api("/api/mailbox?limit=60"), api("/api/alerts")]);
     S.corner = { items: mb.items ?? [], unread: mb.unread ?? 0, alerts: al.alerts ?? [] };
@@ -2328,6 +2540,7 @@ async function renderHarnessSettings(a) {
   card.append(grid);
 
   const save = el("button", "primary", "Сохранить триггеры");
+  save.dataset.write = "";
   save.addEventListener("click", async () => {
     save.disabled = true;
     try {
@@ -2348,6 +2561,9 @@ async function renderHarnessSettings(a) {
 }
 
 /* ------------------------------ wiring ------------------------------ */
+
+$("#loginForm").addEventListener("submit", submitLogin);
+$("#logoutBtn").addEventListener("click", submitLogout);
 
 document.querySelectorAll("#nav button").forEach((b) => b.addEventListener("click", () => setPage(b.dataset.page)));
 $("#start").addEventListener("click", startProject);
