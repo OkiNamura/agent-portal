@@ -153,5 +153,7 @@ node scripts/check-secrets.mjs
 Пуш:
 
 ```bat
-.\.tools\git\cmd\git.exe push
+git.cmd push
 ```
+
+`git.cmd` — обёртка над портативным git: подставляет SSH-ключ из `.tools/ssh2` и вызывает `.tools/git/cmd/git.exe`. Так работает в том числе из песочницы, где обычный git не может запустить свой `sh`.
