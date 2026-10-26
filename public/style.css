@@ -344,6 +344,12 @@ table.tbl td { padding: 7px 8px; border-bottom: 1px solid #171e28; font-family: 
 .docPreview h1, .docPreview h2, .docPreview h3 { font-size: 14px; margin: 10px 0 6px; color: #e7eef8; }
 .docPreview pre { font-family: var(--mono); font-size: 11.5px; white-space: pre-wrap; background: #111823; padding: 8px; border-radius: 8px; }
 .docPreview p { margin: 5px 0; }
+/* презентации */
+.deckSlides { display: flex; flex-direction: column; gap: 8px; max-height: 380px; overflow: auto; }
+.deckSlide { border: 1px solid var(--line); border-radius: 10px; background: #0a0d12; padding: 8px 10px; }
+.deckSlideTitle { font-size: 12.5px; font-weight: 600; color: #e7eef8; margin-bottom: 4px; }
+.deckBullets { margin: 0; padding-left: 18px; font-size: 12px; line-height: 1.5; color: #c3cfdf; }
+.deckBullets li { margin: 2px 0; }
 
 /* ключи и лимиты */
 .keysBody { padding: 6px 18px 24px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; }

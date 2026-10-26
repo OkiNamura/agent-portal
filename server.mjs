@@ -16,6 +16,7 @@ import { agentMetrics, verdictSummary } from "./lib/metrics.mjs";
 import { Mailbox } from "./lib/mailbox.mjs";
 import { collectAlerts, resumeWatch, saveWatchState } from "./lib/watch.mjs";
 import { Studio, generateImage, listImageModels } from "./lib/studio.mjs";
+import { buildPptx } from "./lib/pptx.mjs";
 import { Library, normalizeView, parseRef, matchesView } from "./lib/library.mjs";
 import { buildProjectZipEntries, zipStream } from "./lib/zip-pack.mjs";
 import { Keys, PRESETS } from "./lib/keys.mjs";
@@ -407,6 +408,88 @@ function mockPromptCard(text) {
     reasoning: "MOCK-режим: промт-инженер не вызывался, показана заглушка готового промта.",
   };
 }
+
+/* ---------- презентации: структура слайдов и .pptx ---------- */
+
+const DECK_SLIDES_MAX = 20;
+
+/** Последняя презентация чата — её архитектор правит при повторном сообщении. */
+function lastDeckCard(sid) {
+  const thread = studio.threadList(sid, 80);
+  for (let i = thread.length - 1; i >= 0; i--) {
+    const m = thread[i];
+    if (m.role === "deck" && Array.isArray(m.slides)) return { title: m.title ?? "", slides: m.slides };
+  }
+  return null;
+}
+
+/** Сколько слайдов просили (необязательная подсказка, а не жёсткий лимит ответа модели). */
+function requestedSlideCount(raw) {
+  if (raw == null || raw === "") return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return null;
+  const v = Math.floor(n);
+  return v >= 2 && v <= DECK_SLIDES_MAX ? v : null;
+}
+
+/** Заглушка презентации для MOCK: всегда ровно 2 слайда, но файл собирается по-настоящему. */
+function mockDeckCard(text) {
+  const first = text.split(/\r?\n/).find((line) => line.trim())?.trim() ?? "Презентация";
+  return {
+    title: `Презентация (MOCK): ${first.slice(0, 60)}`,
+    slides: [
+      {
+        title: "Титульный слайд",
+        bullets: [first.slice(0, 180), "MOCK-режим: архитектор не вызывался, структура — заглушка"],
+        notes: "Проверка портала без ключа и без трат.",
+      },
+      {
+        title: "Что внутри",
+        bullets: [
+          "Два слайда-заглушки, как в задании",
+          "Файл .pptx собирается по-настоящему",
+          "Повторное сообщение в том же чате — доработка",
+        ],
+      },
+    ],
+  };
+}
+
+/** Промт архитектору: структура JSON, доработка идёт от текущей презентации. */
+function deckPromptFor(previous, request, slideCount) {
+  const base = previous?.slides?.length
+    ? `Текущая презентация (её нужно доработать, а не писать с нуля; удачное сохрани):\n"""\n${JSON.stringify(previous, null, 2)}\n"""\n\n`
+    : "";
+  const count = slideCount
+    ? `Слайдов должно быть ${slideCount}.`
+    : "Слайдов 3–10, если заказчик не просит иначе.";
+  return `${base}Запрос заказчика: ${request}\n\n${count} Пиши по-русски. Верни СТРОГО JSON без markdown и пояснений: {"title":"название презентации","slides":[{"title":"заголовок слайда","bullets":["пункт","пункт"],"notes":"необязательные заметки"}]}`;
+}
+
+/** Привести ответ модели к структуре сообщения; мусор и пустоту заменяем безопасным дефолтом. */
+function normalizeDeckReply(data, request, slideCount) {
+  const first = String(request ?? "").split(/\r?\n/).find((line) => line.trim())?.trim() ?? "Презентация";
+  const rawSlides = Array.isArray(data?.slides) ? data.slides : [];
+  const slides = rawSlides.slice(0, DECK_SLIDES_MAX).map((s, i) => {
+    const bullets = (Array.isArray(s?.bullets) ? s.bullets : [])
+      .map((b) => String(b ?? "").replace(/\s*\r?\n\s*/g, " ").trim())
+      .filter(Boolean)
+      .slice(0, 12);
+    const slide = {
+      title: String(s?.title ?? "").trim().slice(0, 160) || `Слайд ${i + 1}`,
+      bullets,
+    };
+    if (s?.notes) slide.notes = String(s.notes).slice(0, 2000);
+    return slide;
+  });
+  if (slideCount && slides.length > slideCount) slides.length = slideCount;
+  if (!slides.length) slides.push({ title: first.slice(0, 120), bullets: [first.slice(0, 300)] });
+  return {
+    title: String(data?.title ?? "").trim().slice(0, 160) || first.slice(0, 120) || "Презентация",
+    slides,
+  };
+}
+
 
 let harness = readJson(path.join(CONFIG_DIR, "harness.json"));
 
@@ -1642,7 +1725,7 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const kind = String(body.kind ?? "images");
       if (kind === "video") return json(res, 400, { error: "Видео ещё не подключено — такой тип чата пока не работает." });
-      if (!["images", "docs", "specs", "prompts"].includes(kind)) return json(res, 400, { error: `Неизвестный тип чата: ${kind}` });
+      if (!["images", "docs", "specs", "prompts", "decks"].includes(kind)) return json(res, 400, { error: `Неизвестный тип чата: ${kind}` });
       const session = studio.createSession({ name: body.name, kind });
       return json(res, 200, { session: sessionWithLibrary(session), sessions: sessionsForView("all"), activeId: studio.activeId, view: "all" });
     }
@@ -1732,6 +1815,80 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { message: msg, thread: studio.threadList(sid, 80) });
       } catch (err) {
         return json(res, 502, { error: String(err?.message || err) });
+      }
+    }
+
+    /* ---------- презентации: архитектор пишет структуру, сервер собирает .pptx ---------- */
+
+    if (pathname === "/api/studio/deck" && req.method === "POST") {
+      const body = await readBody(req, 2_000_000);
+      const text = String(body.text ?? "").trim();
+      if (text.length < 2) return json(res, 400, { error: "Пустой текст" });
+
+      let sid;
+      try {
+        sid = studio.assertSession(body.sessionId ?? undefined);
+      } catch (err) {
+        return json(res, 404, { error: String(err.message) });
+      }
+      if (sessionKindOf(sid) !== "decks") return json(res, 409, { error: "Этот чат не для презентаций — создайте чат «Презентации»" });
+      if (library.isDeleted(sessionRef(sid))) return json(res, 409, { error: "Чат в корзине — сначала восстановите его" });
+
+      const slideCount = requestedSlideCount(body.slideCount);
+      // повторное сообщение — доработка: текущую структуру передаём архитектору в промт
+      const previous = lastDeckCard(sid);
+      studio.threadAdd({ role: "user", text }, sid);
+
+      const mock = isMock();
+      let deck;
+      let cost = 0;
+      let model = null;
+      let ms = 0;
+      const started = Date.now();
+
+      if (mock) {
+        deck = mockDeckCard(text);
+      } else {
+        try {
+          const agent = engine.agent("architect");
+          const out = await chat({
+            model: agent.model,
+            temperature: Number(agent.temperature ?? 0.2),
+            maxTokens: 6000,
+            apiKey: keys.resolve(agent.id)?.key ?? null,
+            system: `${agent.prompt}\n\nТы собираешь структуру презентации: только JSON, без markdown. Заголовки и пункты — по-русски, пункты короткие.`,
+            user: deckPromptFor(previous, text, slideCount),
+          });
+          deck = normalizeDeckReply(extractJson(out.text), text, slideCount);
+          cost = Number(out.usage?.cost ?? 0);
+          model = out.model ?? agent.model;
+          ms = Date.now() - started;
+        } catch (err) {
+          return json(res, 502, { error: String(err?.message || err), thread: studio.threadList(sid, 80) });
+        }
+      }
+
+      const filename = `deck-${crypto.randomBytes(6).toString("hex")}.pptx`;
+      try {
+        const buf = buildPptx(deck);
+        studio.saveDeck(filename, buf);
+        const msg = studio.threadAdd(
+          {
+            role: "deck",
+            title: deck.title,
+            slides: deck.slides,
+            file: filename,
+            size: buf.length,
+            mock,
+            cost,
+            model,
+            ms,
+          },
+          sid
+        );
+        return json(res, 200, { message: msg, thread: studio.threadList(sid, 80), mock, file: filename, slides: deck.slides });
+      } catch (err) {
+        return json(res, 500, { error: `Не удалось собрать .pptx: ${String(err?.message || err)}`, thread: studio.threadList(sid, 80) });
       }
     }
 
@@ -1915,13 +2072,44 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    const dkm = pathname.match(/^\/api\/studio\/deck\/([\w-]+)\.pptx$/);
+    if (dkm && req.method === "GET") {
+      const found = studio.findMessage(dkm[1]);
+      if (!found || found.message.role !== "deck") return json(res, 404, { error: "Презентация не найдена" });
+      const deck = found.message;
+      let buf;
+      try {
+        // основной путь — готовый файл в студии; если его убрали руками, честно пересобираем
+        const file = studio.deckPath(deck.file);
+        buf = fs.existsSync(file) ? fs.readFileSync(file) : buildPptx({ title: deck.title, slides: deck.slides });
+      } catch {
+        try {
+          buf = buildPptx({ title: deck.title, slides: deck.slides });
+        } catch (err) {
+          return json(res, 500, { error: `Не удалось собрать .pptx: ${String(err?.message || err)}` });
+        }
+      }
+      const name =
+        String(deck.title ?? "presentation")
+          .replace(/[^\wа-яА-Я\d _-]+/gi, "")
+          .trim()
+          .slice(0, 60) || "presentation";
+      res.writeHead(200, {
+        "Content-Type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(name)}.pptx`,
+        "Content-Length": buf.length,
+        "Cache-Control": "no-store",
+      });
+      return res.end(buf);
+    }
+
     if (pathname === "/api/studio/say" && req.method === "POST") {
       const body = await readBody(req, 14_000_000);
       const sid = body.sessionId ?? undefined;
       const text = String(body.text ?? "").trim();
       if (text.length < 2) return json(res, 400, { error: "Пустой запрос" });
       const sess = studio.sessions.find((s) => s.id === (sid ?? studio.activeId));
-      if (sess && sess.kind !== "images") return json(res, 501, { error: `Чат типа «${sess.kind}» ещё в разработке — сейчас работает только «картинки»` });
+      if (sess && sess.kind !== "images") return json(res, 501, { error: `Чат типа «${sess.kind}» не принимает такие сообщения — используйте раздел этого типа` });
       if (sess && library.isDeleted(sessionRef(sess.id))) return json(res, 409, { error: "Чат в корзине — сначала восстановите его" });
       studio.threadAdd({ role: "user", text, ref: body.referenceId ?? null }, sid);
       const result = await makeProposal(text, body.referenceId ?? null, sid);

@@ -84,6 +84,13 @@ const STUDIO_KIND_META = {
     send: "Сделать промт",
     empty: "Опиши задачу словами: что должен сделать ИИ, на входе и на выходе, чего нельзя делать. Промт-инженер отдаст готовый промт в блоке кода, следующим сообщением его можно доработать.",
   },
+  decks: {
+    title: "Презентации",
+    icon: "📊",
+    placeholder: "Опиши презентацию — архитектор соберёт слайды и .pptx. Следующим сообщением можно попросить доработать…",
+    send: "Собрать презентацию",
+    empty: "Опиши, о чём презентация и для кого. Архитектор придумает слайды с заголовками и пунктами, сервер соберёт .pptx — его можно скачать, а следующим сообщением попросить доработать.",
+  },
   video: {
     title: "Видео",
     icon: "🎬",
@@ -98,6 +105,7 @@ const STUDIO_GROUPS = [
   { kind: "docs", title: "Документы", icon: "📄" },
   { kind: "specs", title: "Спеки", icon: "📐" },
   { kind: "prompts", title: "Промты", icon: "✎" },
+  { kind: "decks", title: "Презентации", icon: "📊", onlyIfChats: true },
   { kind: "video", title: "Видео", icon: "🎬", onlyIfChats: true },
 ];
 
@@ -487,6 +495,11 @@ function renderList() {
   if (S.page === "studio") {
     const head = el("div", "listHead");
     head.append(el("span", null, "Студия"));
+    const addDeck = el("button", "mini", "📊");
+    addDeck.title = "Новый чат презентаций";
+    addDeck.disabled = !canWrite();
+    addDeck.addEventListener("click", () => createSession("decks"));
+    head.append(addDeck);
     const addVideo = el("button", "mini", "🎬");
     addVideo.title = "Новый чат видео (пока не подключено)";
     addVideo.disabled = !canWrite();
@@ -747,7 +760,13 @@ async function createSession(kind) {
     }
     return;
   }
-  const titles = { images: ["Название чата картинок", "Новый чат"], docs: ["Название чата документов", "Документы"], specs: ["Название чата спек", "Новая спека"], prompts: ["Название чата промтов", "Новые промты"] };
+  const titles = {
+    images: ["Название чата картинок", "Новый чат"],
+    docs: ["Название чата документов", "Документы"],
+    specs: ["Название чата спек", "Новая спека"],
+    prompts: ["Название чата промтов", "Новые промты"],
+    decks: ["Название чата презентаций", "Презентация"],
+  };
   const [title, fallback] = titles[kind] ?? ["Название чата", "Новый чат"];
   const name = prompt(title, fallback);
   if (name == null) return;
@@ -802,10 +821,6 @@ function renderThread() {
     box.append(el("div", "empty", "Видео ещё не подключено — создай чат другого типа."));
     return;
   }
-  if (kind === "decks") {
-    box.append(el("div", "empty", "Чат «презентации» ещё в разработке — сейчас работают картинки, документы, спеки и промты."));
-    return;
-  }
 
   if (!S.studio.thread.length) {
     box.append(el("div", "empty", meta.empty));
@@ -813,9 +828,9 @@ function renderThread() {
     return;
   }
 
-  const results = S.studio.thread.filter((m) => m.role === "result" || m.role === "doc" || m.role === "prompt");
+  const results = S.studio.thread.filter((m) => m.role === "result" || m.role === "doc" || m.role === "prompt" || m.role === "deck");
   const spent = results.reduce((s, m) => s + (m.cost || 0), 0);
-  const noun = kind === "images" ? "картинок" : kind === "prompts" ? "промтов" : "документов";
+  const noun = kind === "images" ? "картинок" : kind === "prompts" ? "промтов" : kind === "decks" ? "презентаций" : "документов";
   $("#studioInfo").textContent = `${noun}: ${results.length} · потрачено $${spent.toFixed(3)}`;
 
   for (const msg of S.studio.thread) {
@@ -824,6 +839,7 @@ function renderThread() {
     else if (msg.role === "result") box.append(resultCard(msg));
     else if (msg.role === "doc") box.append(docCard(msg));
     else if (msg.role === "prompt") box.append(promptCard(msg));
+    else if (msg.role === "deck") box.append(deckCard(msg));
   }
   box.scrollTop = box.scrollHeight;
 }
@@ -986,6 +1002,65 @@ function promptCard(msg) {
   return card;
 }
 
+/** Карточка презентации: заголовок, слайды с маркерами, файл, правка и удаление. */
+function deckCard(msg) {
+  const card = el("div", "docCard deckCard");
+  const slides = Array.isArray(msg.slides) ? msg.slides : [];
+  const head = el("div", "docHead");
+  head.append(el("b", null, msg.title || "Презентация"));
+  head.append(el("span", "tag", `слайдов: ${slides.length}`));
+  if (msg.mock) head.append(el("span", "tag mockTag", "MOCK"));
+  card.append(head);
+
+  const list = el("div", "deckSlides");
+  slides.forEach((slide, i) => {
+    const item = el("div", "deckSlide");
+    item.append(el("div", "deckSlideTitle", `${i + 1}. ${slide?.title || "Слайд"}`));
+    const bullets = Array.isArray(slide?.bullets) ? slide.bullets : [];
+    if (bullets.length) {
+      const ul = el("ul", "deckBullets");
+      for (const bullet of bullets) ul.append(el("li", null, String(bullet)));
+      item.append(ul);
+    } else {
+      item.append(el("div", "dim", "без пунктов"));
+    }
+    if (slide?.notes) {
+      const d = document.createElement("details");
+      d.className = "reasoning";
+      d.append(el("summary", null, "заметки"), el("div", "why", String(slide.notes)));
+      item.append(d);
+    }
+    list.append(item);
+  });
+  card.append(list);
+
+  const meta = el("div", "meta");
+  meta.append(
+    el("span", null, msg.model || "architect"),
+    el("span", null, `$${(msg.cost || 0).toFixed(4)}`),
+    el("span", null, `${((msg.ms || 0) / 1000).toFixed(1)} с`),
+    el("span", null, msg.size ? `${(msg.size / 1024).toFixed(1)} КБ` : ""),
+    el("span", null, msg.at ? new Date(msg.at).toLocaleString("ru-RU") : "")
+  );
+  card.append(meta);
+
+  const download = document.createElement("a");
+  download.className = "mini link";
+  download.textContent = "скачать .pptx";
+  download.href = `/api/studio/deck/${msg.id}.pptx`;
+  download.download = "";
+
+  const edit = smallBtn("править", "Следующим сообщением попросите поправить презентацию", () => {
+    const input = $("#imgPrompt");
+    input.value = "";
+    input.placeholder = "Что поправить в презентации? Например: «добавь слайд про бюджет»";
+    input.focus();
+  });
+
+  card.append(actionsRow([download, edit, smallBtn("удалить", "Убрать презентацию и всё после неё", () => truncateAt(msg))]));
+  return card;
+}
+
 
 /* общая обёртка для вызовов студии, чтобы не дублировать обновление треда */
 async function studioCall(path, body) {
@@ -1063,6 +1138,7 @@ function editUserMessage(msg, wrap) {
       if (kind === "docs") await studioCall("/api/studio/doc", { text });
       else if (kind === "specs") await studioCall("/api/studio/spec", { text });
       else if (kind === "prompts") await studioCall("/api/studio/prompt", { text });
+      else if (kind === "decks") await studioCall("/api/studio/deck", { text });
       else await studioCall("/api/studio/propose", { text });
     } catch (err) {
       $("#studioInfo").textContent = err.message;
@@ -1272,6 +1348,7 @@ async function sendStudio() {
     docs: ["/api/studio/doc", "редактор работает…"],
     specs: ["/api/studio/spec", "архитектор пишет спеку…"],
     prompts: ["/api/studio/prompt", "промт-инженер думает…"],
+    decks: ["/api/studio/deck", "архитектор собирает презентацию…"],
   };
   if (textChats[kind]) {
     const [path, status] = textChats[kind];
