@@ -1,6 +1,7 @@
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import { fileURLToPath } from "node:url";
 
@@ -16,7 +17,7 @@ import { Mailbox } from "./lib/mailbox.mjs";
 import { collectAlerts, resumeWatch, saveWatchState } from "./lib/watch.mjs";
 import { Studio, generateImage, listImageModels } from "./lib/studio.mjs";
 import { Library, normalizeView, parseRef, matchesView } from "./lib/library.mjs";
-import { buildProjectZip } from "./lib/zip-pack.mjs";
+import { buildProjectZipEntries, zipStream } from "./lib/zip-pack.mjs";
 import { Keys, PRESETS } from "./lib/keys.mjs";
 import {
   SESSION_COOKIE,
@@ -40,6 +41,8 @@ loadEnv(ROOT);
 if (process.argv.includes("--mock")) process.env.MOCK = "1";
 
 const PORT = Number(process.env.PORT || 7777);
+/* Одноразовый (долгоживущий) токен для статики: /studio/x.png?token=... и /preview/...?token=... */
+const PORTAL_TOKEN = String(process.env.PORTAL_TOKEN ?? "").trim();
 const PUBLIC = path.join(ROOT, "public");
 const CONFIG_DIR = path.join(ROOT, "config");
 
@@ -515,6 +518,132 @@ const readBody = (req, limit = 2_000_000) =>
     req.on("error", reject);
   });
 
+/* ------------------------- ограничение попыток входа ------------------------- */
+
+/*
+ * Память процесса: ip → массив меток времени неудачных попыток.
+ * Успешный вход стирает запись целиком, поэтому после него снова доступны все
+ * попытки. Просроченные метки (старше часа) вычищаются при каждой проверке и
+ * по таймеру — Map не растёт от простаивающих адресов.
+ */
+const LOGIN_WINDOW_5M = 5 * 60 * 1000;
+const LOGIN_WINDOW_1H = 60 * 60 * 1000;
+const LOGIN_MAX_5M = Math.max(1, Number(process.env.LOGIN_MAX_5M || 5) || 5);
+const LOGIN_MAX_1H = Math.max(1, Number(process.env.LOGIN_MAX_1H || 20) || 20);
+const loginFailures = new Map();
+
+/** IP клиента: x-forwarded-for учитываем только при TRUST_PROXY=1 (иначе его подделает кто угодно). */
+function clientIp(req) {
+  const trustProxy = /^(1|true|yes)$/i.test(String(process.env.TRUST_PROXY ?? "").trim());
+  if (trustProxy) {
+    const header = req?.headers?.["x-forwarded-for"];
+    const raw = Array.isArray(header) ? header[0] : String(header ?? "");
+    const first = raw.split(",")[0].trim();
+    if (first) return first.replace(/^::ffff:/i, "").toLowerCase();
+  }
+  return String(req?.socket?.remoteAddress ?? "unknown").replace(/^::ffff:/i, "").toLowerCase();
+}
+
+/** Убирает метки старше часа и пустые записи. */
+function pruneLoginFailures(now = Date.now()) {
+  for (const [ip, times] of loginFailures) {
+    const fresh = times.filter((t) => Number.isFinite(t) && now - t < LOGIN_WINDOW_1H);
+    if (fresh.length) loginFailures.set(ip, fresh);
+    else loginFailures.delete(ip);
+  }
+}
+
+/**
+ * Можно ли пускать этот IP к форме входа.
+ * @returns {{ blocked: boolean, retryAfter?: number, minutes?: number }}
+ *   retryAfter — секунды для заголовка Retry-After, minutes — для текста ошибки.
+ */
+function loginGate(ip, now = Date.now()) {
+  pruneLoginFailures(now);
+  const times = loginFailures.get(ip) ?? [];
+  const within5m = times.filter((t) => now - t < LOGIN_WINDOW_5M);
+  const within1h = times.filter((t) => now - t < LOGIN_WINDOW_1H);
+
+  let waitMs = 0;
+  if (within5m.length >= LOGIN_MAX_5M) {
+    waitMs = Math.max(waitMs, within5m[0] + LOGIN_WINDOW_5M - now);
+  }
+  if (within1h.length >= LOGIN_MAX_1H) {
+    waitMs = Math.max(waitMs, within1h[0] + LOGIN_WINDOW_1H - now);
+  }
+  if (!waitMs) return { blocked: false };
+
+  const retryAfter = Math.max(1, Math.ceil(waitMs / 1000));
+  return { blocked: true, retryAfter, minutes: Math.max(1, Math.ceil(retryAfter / 60)) };
+}
+
+/** Неудачная попытка: записываем метку (blocked-попытки сюда не попадают). */
+function recordLoginFailure(ip, now = Date.now()) {
+  const times = (loginFailures.get(ip) ?? []).filter((t) => now - t < LOGIN_WINDOW_1H);
+  times.push(now);
+  loginFailures.set(ip, times);
+  // Страховка от вала неудач с одного адреса — не копим больше лимита за час.
+  if (times.length > LOGIN_MAX_1H) times.splice(0, times.length - LOGIN_MAX_1H);
+}
+
+function resetLoginFailures(ip) {
+  loginFailures.delete(ip);
+}
+
+const loginPruneTimer = setInterval(() => pruneLoginFailures(), 10 * 60 * 1000);
+loginPruneTimer.unref?.();
+
+/* ------------------------------ защита статики ------------------------------ */
+
+/** Постоянное сравнение: длина и содержимое не дают тайминговой утечки токена. */
+function tokenMatches(given) {
+  if (!PORTAL_TOKEN || typeof given !== "string" || !given) return false;
+  const a = crypto.createHash("sha256").update(given, "utf8").digest();
+  const b = crypto.createHash("sha256").update(PORTAL_TOKEN, "utf8").digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
+/**
+ * Кто смотрит /preview/** и /studio/**: сессия из cookie либо PORTAL_TOKEN в query.
+ * @returns {{ login: string, role: string, viaToken?: boolean } | null}
+ */
+function staticUser(req, url) {
+  const user = requireUser(req);
+  if (user) return user;
+  if (tokenMatches(url?.searchParams?.get("token") ?? "")) {
+    return { login: "portal-token", role: "viewer", viaToken: true };
+  }
+  return null;
+}
+
+/** Пишет чанк ZIP-потока с учётом backpressure; рвётся, если клиент ушёл. */
+function writeChunk(res, chunk) {
+  if (res.destroyed || res.writableEnded) return Promise.reject(new Error("соединение с клиентом закрыто"));
+  if (res.write(chunk)) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      res.off("drain", onDrain);
+      res.off("close", onClose);
+      res.off("error", onError);
+    };
+    const onDrain = () => {
+      cleanup();
+      resolve();
+    };
+    const onClose = () => {
+      cleanup();
+      reject(new Error("соединение с клиентом закрыто"));
+    };
+    const onError = (err) => {
+      cleanup();
+      reject(err);
+    };
+    res.on("drain", onDrain);
+    res.on("close", onClose);
+    res.on("error", onError);
+  });
+}
+
 /** Пометки блока из engine: подмены модели, повторная проверка, авто-приём, целостность. */
 function blockStateFields(b = {}) {
   return {
@@ -793,7 +922,8 @@ function serveFile(res, file, cacheSeconds = 0) {
   res.writeHead(200, {
     "Content-Type": MIME[path.extname(file)] ?? "application/octet-stream",
     "Content-Length": body.length,
-    "Cache-Control": cacheSeconds ? `public, max-age=${cacheSeconds}` : "no-store",
+    // private: файлы за входом не должны попадать в общие кэши (в т.ч. при ?token=)
+    "Cache-Control": cacheSeconds ? `private, max-age=${cacheSeconds}` : "no-store",
   });
   res.end(body);
 }
@@ -816,7 +946,7 @@ function findEntry(run) {
 }
 
 /** /preview/<runId>/mockup — макет, /preview/<runId>/app/<path> — собранный проект. */
-function servePreview(res, pathname) {
+function servePreview(res, pathname, token = null) {
   const parts = pathname.split("/").filter(Boolean); // ["preview", runId, ...]
   const [, runId, kind, ...rest] = parts;
   if (!runId) return json(res, 404, { error: "not found" });
@@ -827,6 +957,8 @@ function servePreview(res, pathname) {
     return json(res, 404, { error: "run not found" });
   }
   const base = store.runDir(run.id);
+  // редирект на точку входа не должен терять ?token= (иначе браузер без cookie получит 401)
+  const query = token ? `?token=${encodeURIComponent(token)}` : "";
 
   if (kind === "mockup") return serveFile(res, path.join(base, "artifacts", "mockup.html"));
 
@@ -834,7 +966,7 @@ function servePreview(res, pathname) {
     if (!rest.length) {
       const entry = findEntry(run);
       if (!entry) return json(res, 404, { error: "в проекте нет html-файлов" });
-      res.writeHead(302, { Location: `/preview/${run.id}/app/${entry}` });
+      res.writeHead(302, { Location: `/preview/${run.id}/app/${entry}${query}` });
       return res.end();
     }
     const rel = rest.join("/");
@@ -880,13 +1012,17 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
+    // статика прогонов и студии — только по сессии (или ?token=PORTAL_TOKEN)
+    if (pathname.startsWith("/studio/") || pathname.startsWith("/preview/")) {
+      if (!staticUser(req, url)) return json(res, 401, { error: "нужен вход" });
+    }
     if (pathname.startsWith("/studio/")) {
       const file = pathname.slice("/studio/".length);
       const item = studio.items.find((i) => i.file === file);
       if (!item) return json(res, 404, { error: "not found" });
       return serveFile(res, studio.filePath(item), 3600);
     }
-    if (pathname.startsWith("/preview/")) return servePreview(res, pathname);
+    if (pathname.startsWith("/preview/")) return servePreview(res, pathname, url.searchParams.get("token"));
     if (!pathname.startsWith("/api/")) return serveStatic(req, res, pathname);
 
     /* ------------------------------ авторизация ------------------------------ */
@@ -897,9 +1033,21 @@ const server = http.createServer(async (req, res) => {
     if (pathname === "/api/login") {
       if (method === "GET") return json(res, 200, { ok: true, login: "/api/login (POST)" });
       if (method === "POST") {
+        const ip = clientIp(req);
         const body = await readBody(req);
+        // Сначала проверяем пару: верный пароль всегда пускает и обнуляет счётчик,
+        // а лимит считает только неудачи (заблокировать себя опечаткой нельзя).
         const user = verify(body.login, body.password);
-        if (!user) return json(res, 401, { error: "неверный логин или пароль" });
+        if (!user) {
+          const gate = loginGate(ip);
+          if (gate.blocked) {
+            res.setHeader("Retry-After", String(gate.retryAfter));
+            return json(res, 429, { error: `слишком много попыток входа, попробуй через ${gate.minutes} минут` });
+          }
+          recordLoginFailure(ip);
+          return json(res, 401, { error: "неверный логин или пароль" });
+        }
+        resetLoginFailures(ip);
         const token = createSession(user.id);
         res.setHeader("Set-Cookie", sessionCookie(token));
         return json(res, 200, { ok: true, user: { login: user.login, role: user.role } });
@@ -2158,20 +2306,31 @@ const server = http.createServer(async (req, res) => {
       }
 
       if (action === "export.zip" && req.method === "GET") {
+        let built;
         try {
           const project = projects.byRun(run.id);
-          const { buffer, name, ascii } = buildProjectZip({ run, store, project });
-          const encoded = encodeURIComponent(name).replace(/['()]/g, (c) => (c === "'" ? "%27" : c === "(" ? "%28" : "%29"));
-          res.writeHead(200, {
-            "Content-Type": "application/zip",
-            "Content-Length": buffer.length,
-            "Content-Disposition": `attachment; filename="${ascii}"; filename*=UTF-8''${encoded}`,
-            "Cache-Control": "no-store",
-          });
-          return res.end(buffer);
+          built = buildProjectZipEntries({ run, store, project });
         } catch (err) {
           return json(res, 500, { error: `ZIP не собрался: ${String(err?.message || err)}` });
         }
+        const { entries, name, ascii } = built;
+        const encoded = encodeURIComponent(name).replace(/['()]/g, (c) => (c === "'" ? "%27" : c === "(" ? "%28" : "%29"));
+        res.writeHead(200, {
+          "Content-Type": "application/zip",
+          "Content-Disposition": `attachment; filename="${ascii}"; filename*=UTF-8''${encoded}`,
+          "Cache-Control": "no-store",
+          "X-Accel-Buffering": "no",
+        });
+        // Архив уходит в ответ по частям: заголовок → данные файла → central directory → EOCD.
+        // Content-Length не ставим — размер заранее неизвестен (chunked), память не растёт.
+        try {
+          for await (const chunk of zipStream(entries)) await writeChunk(res, chunk);
+          res.end();
+        } catch (err) {
+          console.error(`[zip] ${String(err?.message || err)}`);
+          res.destroy();
+        }
+        return;
       }
 
       if (action === "approve" && req.method === "POST") {

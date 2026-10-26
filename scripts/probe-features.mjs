@@ -314,8 +314,9 @@ try {
   check("суммарная стоимость в галерее", Math.abs(Number(gallery.data.cost) - 0.05) < 1e-9, `$${gallery.data.cost}`);
 
   const defaultImg = gallery.data.items.find((i) => i.id === "img2") ?? gallery.data.items[0];
-  const studioGet = await request(defaultImg.url);
-  check("превью картинки отдаётся по /studio/<file>", studioGet.status === 200, `статус ${studioGet.status}`);
+  // /studio/* закрыт сессией: браузер шлёт cookie и для <img>, проверка — тоже с cookie.
+  const studioGet = await request(defaultImg.url, { cookie: admin.cookie });
+  check("превью картинки отдаётся по /studio/<file> с сессией", studioGet.status === 200, `статус ${studioGet.status}`);
 
   /* 2. viewer: чтение можно, удаление/решения/дежурство — нельзя */
   const viewerPass = "viewer-pass-123";
