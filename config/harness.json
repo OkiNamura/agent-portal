@@ -12,5 +12,10 @@
     "stuckMinutes": 15,
     "dailyBudget": 2
   },
-  "note": "Что будит Харнесса: события портала превращаются в сообщения в угловом чате."
+  "watch": {
+    "everyMin": 10,
+    "persist": true,
+    "stateFile": "watch.state.json"
+  },
+  "note": "Что будит Харнесса: события портала превращаются в сообщения в угловом чате. watch — состояние дежурного (running/everyMin/lastRunAt) переживает рестарт: lib/watch.mjs пишет watch.state.json в каталог запусков, server вызывает resumeWatch() при старте."
 }

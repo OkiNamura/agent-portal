@@ -19,7 +19,22 @@ import { fileURLToPath } from "node:url";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
-const DIR = path.join(ROOT, "output", "notepad");
+
+/**
+ * Каталог блокнота. Без аргумента — output/notepad самого портала (как раньше).
+ * С аргументом — переданный каталог; если в нём блокнот лежит в output/notepad
+ * (так его видят артефакты прогона), проверяем этот подкаталог.
+ */
+function resolveDir(raw) {
+  if (!raw) return path.join(ROOT, "output", "notepad");
+  const dir = path.resolve(raw);
+  const nested = path.join(dir, "output", "notepad");
+  if (!fs.existsSync(path.join(dir, "index.html")) && fs.existsSync(path.join(nested, "index.html"))) return nested;
+  return dir;
+}
+
+const DIR = resolveDir(process.argv[2]);
+console.log(`check-notepad: ${DIR}`);
 
 let passed = 0;
 let failed = 0;
@@ -76,6 +91,12 @@ const REQUIRED_FILES = [
 
 for (const name of REQUIRED_FILES) {
   check(fs.existsSync(path.join(DIR, name)), `file exists: ${name}`);
+}
+
+// без index.html дальше читать нечего — падаем понятным сообщением, а не стектрейсом
+if (!fs.existsSync(path.join(DIR, "index.html"))) {
+  console.log(`\nSummary: ${passed} passed, ${failed} failed`);
+  process.exit(1);
 }
 
 const html = read("index.html");

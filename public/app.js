@@ -33,8 +33,8 @@ const S = {
   modelsTried: false,
   logCutoff: 0,
   metrics: null,
-  studio: { thread: [], models: [], sessions: [], activeId: null, refItem: null, refData: null, lastText: "" },
-  gallery: { items: [], total: 0, cost: 0, q: "" },
+  studio: { thread: [], models: [], sessions: [], activeId: null, refItem: null, refData: null, lastText: "", view: "all", collapsed: {} },
+  gallery: { items: [], total: 0, cost: 0, q: "", view: "all" },
   watch: { running: false, everyMin: 10, lastRunAt: null, lastAlerts: [] },
   corner: { items: [], unread: 0, alerts: [] },
   globalStream: null,
@@ -42,6 +42,211 @@ const S = {
   tab: "flow",
   view: "mockup",
 };
+
+/* ------------------------- библиотека и группы студии ------------------------- */
+
+const LIB_VIEWS = [
+  ["all", "Все", "Все"],
+  ["fav", "★", "Избранное"],
+  ["archive", "🗄", "Архив"],
+  ["trash", "🗑", "Корзина"],
+];
+const STUDIO_GROUP_KEY = "portal.studio.groups";
+const STUDIO_VIEW_KEY = "portal.studio.view";
+const GALLERY_VIEW_KEY = "portal.gallery.view";
+
+const STUDIO_KIND_META = {
+  images: {
+    title: "Картинки",
+    icon: "🖼",
+    placeholder: "Опиши, что хочешь — художник перепишет это в промт и покажет, что отправит",
+    send: "Художник",
+    empty: "Опиши, что хочешь — художник перепишет это в промт, покажет, что отправит, и нарисует после твоего «Отправить».",
+  },
+  docs: {
+    title: "Документы",
+    icon: "📄",
+    placeholder: "Вставь текст документа — редактор вычитает или приведёт в порядок…",
+    send: "Вычитать",
+    empty: "Вставь текст — редактор приведёт его в порядок. Короткий запрос он может переписать, большой документ только вычитает: орфография и разметка, без изменения смысла.",
+  },
+  specs: {
+    title: "Спеки",
+    icon: "📐",
+    placeholder: "Опиши задачу — архитектор напишет спеку. Следующим сообщением можно попросить доработать…",
+    send: "Написать спеку",
+    empty: "Опиши задачу словами: что нужно сделать, для кого и по каким критериям принимать. Архитектор соберёт спеку-договор в markdown, её можно скачать, поправить или доработать следующим сообщением.",
+  },
+  prompts: {
+    title: "Промты",
+    icon: "✎",
+    placeholder: "Опиши текстовую задачу — промт-инженер соберёт готовый промт…",
+    send: "Сделать промт",
+    empty: "Опиши задачу словами: что должен сделать ИИ, на входе и на выходе, чего нельзя делать. Промт-инженер отдаст готовый промт в блоке кода, следующим сообщением его можно доработать.",
+  },
+  video: {
+    title: "Видео",
+    icon: "🎬",
+    placeholder: "Видео ещё не подключено",
+    send: "Создать",
+    empty: "Видео ещё не подключено.",
+  },
+};
+
+const STUDIO_GROUPS = [
+  { kind: "images", title: "Картинки", icon: "🖼" },
+  { kind: "docs", title: "Документы", icon: "📄" },
+  { kind: "specs", title: "Спеки", icon: "📐" },
+  { kind: "prompts", title: "Промты", icon: "✎" },
+  { kind: "video", title: "Видео", icon: "🎬", onlyIfChats: true },
+];
+
+function readLocal(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return fallback;
+    return JSON.parse(raw);
+  } catch {
+    return fallback;
+  }
+}
+
+function writeLocal(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    /* приватный режим — обойдёмся без запоминания */
+  }
+}
+
+function libViewValue(raw) {
+  return LIB_VIEWS.some(([v]) => v === raw) ? raw : "all";
+}
+
+function canWrite() {
+  return S.role === "admin" || S.role === "editor";
+}
+
+function initLibraryUi() {
+  S.studio.view = libViewValue(readLocal(STUDIO_VIEW_KEY, "all"));
+  S.gallery.view = libViewValue(readLocal(GALLERY_VIEW_KEY, "all"));
+  const collapsed = readLocal(STUDIO_GROUP_KEY, {});
+  S.studio.collapsed = collapsed && typeof collapsed === "object" ? collapsed : {};
+}
+
+function libViewSwitch(active, onChange, compact = false) {
+  const row = el("div", "libViews");
+  for (const [value, icon, label] of LIB_VIEWS) {
+    const b = el("button", "libView" + (active === value ? " active" : ""), compact && value !== "all" ? icon : `${icon} ${label}`);
+    b.type = "button";
+    b.title = label;
+    b.dataset.view = value;
+    b.addEventListener("click", () => onChange(value));
+    row.append(b);
+  }
+  return row;
+}
+
+function toggleStudioGroup(kind) {
+  S.studio.collapsed = { ...(S.studio.collapsed ?? {}), [kind]: !S.studio.collapsed?.[kind] };
+  writeLocal(STUDIO_GROUP_KEY, S.studio.collapsed);
+  renderList();
+}
+
+function kindMeta(kind) {
+  return STUDIO_KIND_META[kind] ?? { title: kind, icon: "•", placeholder: "", send: "Отправить", empty: "Пустой чат." };
+}
+
+function dateShort(iso) {
+  if (!iso) return "";
+  try {
+    return new Date(iso).toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+  } catch {
+    return iso;
+  }
+}
+
+/** После любой пометки библиотеки перезагружаем то, что видно на экране. */
+async function refreshAfterLibrary() {
+  if (S.page === "studio") await reloadStudioSessions();
+  if (S.page === "gallery") await loadGallery();
+}
+
+async function markLibrary(ref, patch) {
+  try {
+    await api("/api/library/mark", { method: "POST", body: JSON.stringify({ ref, ...patch }) });
+    await refreshAfterLibrary();
+  } catch (err) {
+    alert(err.message);
+  }
+}
+
+async function trashLibrary(ref, label = "элемент") {
+  if (!confirm(`Переместить ${label} в корзину? Восстановить можно будет из раздела «Корзина».`)) return;
+  try {
+    await api("/api/library/trash", { method: "POST", body: JSON.stringify({ ref }) });
+    await refreshAfterLibrary();
+  } catch (err) {
+    alert(err.message);
+  }
+}
+
+async function restoreLibrary(ref) {
+  try {
+    await api("/api/library/restore", { method: "POST", body: JSON.stringify({ ref }) });
+    await refreshAfterLibrary();
+  } catch (err) {
+    alert(err.message);
+  }
+}
+
+async function purgeLibrary(ref, label = "элемент") {
+  if (!confirm(`Удалить ${label} навсегда? Файлы и переписка будут удалены физически, отменить нельзя.`)) return;
+  try {
+    await api("/api/library/purge", { method: "DELETE", body: JSON.stringify({ ref }) });
+    await refreshAfterLibrary();
+  } catch (err) {
+    alert(err.message);
+  }
+}
+
+function starButton(ref, fav) {
+  const b = el("button", "star" + (fav ? " on" : ""), fav ? "★" : "☆");
+  b.type = "button";
+  b.title = fav ? "Убрать из избранного" : "В избранное";
+  b.addEventListener("click", (e) => {
+    e.stopPropagation();
+    markLibrary(ref, { fav: !fav });
+  });
+  return b;
+}
+
+/** Кнопка «⋯» с меню: архив/корзина. */
+function libraryMenu(ref, { archived = false, deleted = false } = {}) {
+  const wrap = el("div", "menuWrap");
+  const btn = el("button", "menuBtn", "⋯");
+  btn.type = "button";
+  btn.title = "Ещё: архив и корзина";
+  const menu = el("div", "itemMenu hidden");
+  const add = (label, fn, cls = "mini") => {
+    const b = el("button", cls, label);
+    b.type = "button";
+    b.addEventListener("click", (e) => {
+      e.stopPropagation();
+      menu.classList.add("hidden");
+      fn();
+    });
+    menu.append(b);
+  };
+  add(archived ? "вернуть из архива" : "в архив", () => markLibrary(ref, { archived: !archived }));
+  if (!deleted) add("в корзину", () => trashLibrary(ref), "mini danger");
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    menu.classList.toggle("hidden");
+  });
+  wrap.append(btn, menu);
+  return wrap;
+}
 
 const api = async (path, opts = {}) => {
   const method = String(opts.method ?? "GET").toUpperCase();
@@ -152,6 +357,7 @@ async function boot() {
   try {
     const me = await api("/api/me");
     applyRole(me);
+    initLibraryUi();
     const st = await api("/api/state");
     S.mode = st.mode;
     S.agentsFile = st.agents;
@@ -280,32 +486,26 @@ function renderList() {
 
   if (S.page === "studio") {
     const head = el("div", "listHead");
-    head.append(el("span", null, "Чаты"));
-    const addImg = el("button", "mini", "+");
-    addImg.title = "Новый чат картинок";
-    addImg.addEventListener("click", () => createSession("images"));
-    const addDoc = el("button", "mini", "📄");
-    addDoc.title = "Новый чат документов";
-    addDoc.addEventListener("click", () => createSession("docs"));
-    head.append(addDoc, addImg);
+    head.append(el("span", null, "Студия"));
+    const addVideo = el("button", "mini", "🎬");
+    addVideo.title = "Новый чат видео (пока не подключено)";
+    addVideo.disabled = !canWrite();
+    addVideo.addEventListener("click", () => createSession("video"));
+    head.append(addVideo);
     box.append(head);
 
-    if (!S.studio.sessions.length) box.append(el("div", "empty", "пока нет чатов"));
-    for (const s of S.studio.sessions) {
-      const item = el("div", "item" + (s.id === S.studio.activeId ? " active" : ""));
-      const txt = el("div", "txt");
-      txt.append(el("div", "n", s.name), el("div", "m", `${s.kind === "images" ? "картинки" : s.kind} · сообщений: ${s.messages}`));
-      const kill = el("button", "kill", "✕");
-      kill.title = "Удалить чат";
-      kill.addEventListener("click", (e) => {
-        e.stopPropagation();
-        removeSession(s);
-      });
-      item.append(txt, kill);
-      item.addEventListener("click", () => switchSession(s.id));
-      item.addEventListener("dblclick", () => renameSession(s));
-      box.append(item);
+    box.append(libViewSwitch(S.studio.view, setStudioView, false));
+
+    const sessions = S.studio.sessions ?? [];
+    const known = new Set();
+    for (const group of STUDIO_GROUPS) {
+      const chats = sessions.filter((s) => (s.kind ?? "images") === group.kind);
+      if (group.onlyIfChats && !chats.length) continue;
+      known.add(group.kind);
+      box.append(renderStudioGroup(group, chats));
     }
+    const other = sessions.filter((s) => !known.has(s.kind ?? "images"));
+    if (other.length) box.append(renderStudioGroup({ kind: "other", title: "Другое", icon: "•" }, other));
     return;
   }
 
@@ -317,15 +517,17 @@ function renderList() {
     again.addEventListener("click", () => loadGallery());
     head.append(again);
     box.append(head);
+    box.append(libViewSwitch(S.gallery.view, setGalleryView, false));
+    const viewLabel = LIB_VIEWS.find(([v]) => v === S.gallery.view)?.[2] ?? "Все";
     const item = el("div", "item active");
     const txt = el("div", "txt");
     txt.append(
-      el("div", "n", "Все изображения"),
+      el("div", "n", viewLabel),
       el("div", "m", `${S.gallery.total} шт. · $${Number(S.gallery.cost || 0).toFixed(3)}`)
     );
     item.append(txt);
     box.append(item);
-    box.append(el("div", "empty", "Фильтр по промту — сверху. Удаление доступно редактору и админу."));
+    box.append(el("div", "empty", canWrite() ? "Звёздочка — в избранное, меню — в архив или корзину." : "Роль viewer: только просмотр."));
     return;
   }
 
@@ -343,6 +545,73 @@ function renderList() {
     }
     return;
   }
+}
+
+function renderStudioGroup(group, chats) {
+  const collapsed = Boolean(S.studio.collapsed?.[group.kind]);
+  const wrap = el("div", "studioGroup");
+  const head = el("div", "groupHead");
+  head.append(
+    el("span", "groupCaret", collapsed ? "▸" : "▾"),
+    el("span", "groupTitle", `${group.icon ?? ""} ${group.title}`.trim()),
+    el("span", "groupCount", String(chats.length))
+  );
+  const add = el("button", "mini groupAdd", "+");
+  add.type = "button";
+  add.title = `Новый чат: ${String(group.title).toLowerCase()}`;
+  add.disabled = !canWrite();
+  add.addEventListener("click", (e) => {
+    e.stopPropagation();
+    createSession(group.kind);
+  });
+  head.append(add);
+  head.title = collapsed ? "Развернуть группу" : "Свернуть группу";
+  head.addEventListener("click", () => toggleStudioGroup(group.kind));
+  wrap.append(head);
+
+  if (!collapsed) {
+    const body = el("div", "groupBody");
+    if (!chats.length) body.append(el("div", "empty groupEmpty", "пока нет чатов"));
+    for (const s of chats) body.append(studioSessionItem(s));
+    wrap.append(body);
+  }
+  return wrap;
+}
+
+function studioSessionItem(s) {
+  const wrap = el("div", "itemWrap");
+  const item = el("div", "item" + (s.id === S.studio.activeId ? " active" : ""));
+  const txt = el("div", "txt");
+  const n = el("div", "n");
+  n.append(el("span", null, s.name));
+  if (s.archived) n.append(el("span", "tag", "архив"));
+  txt.append(n);
+  const meta = el("div", "m", `${kindMeta(s.kind).title.toLowerCase()} · сообщений: ${s.messages ?? 0}`);
+  if (s.deletedAt) meta.append(el("span", "libDeleted", ` · удалён ${dateShort(s.deletedAt)}`));
+  txt.append(meta);
+  item.append(txt);
+
+  if (s.deletedAt) {
+    item.append(el("span", "deletedMark", "🗑"));
+  } else {
+    if (canWrite()) item.append(starButton(s.ref, Boolean(s.fav)));
+    if (canWrite()) item.append(libraryMenu(s.ref, { archived: Boolean(s.archived) }));
+  }
+
+  item.addEventListener("click", () => switchSession(s.id));
+  item.addEventListener("dblclick", (e) => {
+    e.preventDefault();
+    if (canWrite()) renameSession(s);
+  });
+  wrap.append(item);
+
+  if (s.deletedAt && canWrite()) {
+    const acts = el("div", "itemActions");
+    acts.append(smallBtn("восстановить", "Вернуть чат из корзины", () => restoreLibrary(s.ref)));
+    acts.append(smallBtn("удалить навсегда", "Удалить чат и переписку физически", () => purgeLibrary(s.ref, `чат «${s.name}»`), "mini danger"));
+    wrap.append(acts);
+  }
+  return wrap;
 }
 
 /* ------------------------------ картинки ------------------------------ */
@@ -390,24 +659,66 @@ async function loadStudio() {
     }
   }
   try {
-    const { sessions, activeId } = await api("/api/studio/sessions");
+    const { sessions, activeId } = await api(`/api/studio/sessions?view=${encodeURIComponent(S.studio.view)}`);
     S.studio.sessions = sessions ?? [];
     const keep = S.studio.activeId && S.studio.sessions.some((s) => s.id === S.studio.activeId);
-    S.studio.activeId = keep ? S.studio.activeId : activeId ?? S.studio.sessions[0]?.id;
+    S.studio.activeId = keep ? S.studio.activeId : activeId ?? S.studio.sessions[0]?.id ?? null;
     await loadThread();
     renderList();
+    updateStudioChrome();
   } catch (err) {
     $("#studioInfo").textContent = err.message;
   }
 }
 
+async function reloadStudioSessions() {
+  try {
+    const { sessions, activeId } = await api(`/api/studio/sessions?view=${encodeURIComponent(S.studio.view)}`);
+    S.studio.sessions = sessions ?? [];
+    const keep = S.studio.activeId && S.studio.sessions.some((s) => s.id === S.studio.activeId);
+    S.studio.activeId = keep ? S.studio.activeId : activeId ?? S.studio.sessions[0]?.id ?? null;
+    renderList();
+    await loadThread();
+    updateStudioChrome();
+  } catch (err) {
+    $("#studioInfo").textContent = err.message;
+  }
+}
+
+async function setStudioView(view) {
+  S.studio.view = libViewValue(view);
+  writeLocal(STUDIO_VIEW_KEY, S.studio.view);
+  await reloadStudioSessions();
+}
+
 async function loadThread() {
   const sid = S.studio.activeId;
-  if (!sid) return;
+  if (!sid) {
+    S.studio.thread = [];
+    renderThread();
+    return;
+  }
   const { thread } = await api(`/api/studio/thread?session=${encodeURIComponent(sid)}`);
   if (S.studio.activeId !== sid) return; // успели переключиться — чужой ответ не применяем
   S.studio.thread = thread ?? [];
   renderThread();
+}
+
+function updateStudioChrome() {
+  const sess = S.studio.sessions.find((s) => s.id === S.studio.activeId);
+  const kind = sess?.kind ?? "images";
+  const isImages = kind === "images";
+  const meta = kindMeta(kind);
+  $("#imgPrompt").placeholder = meta.placeholder;
+  $("#imgSend").textContent = meta.send;
+  const directLabel = $("#imgDirect")?.closest("label");
+  if (directLabel) directLabel.style.display = isImages ? "" : "none";
+  const attach = $("#imgFile")?.closest("label");
+  if (attach) attach.style.display = isImages ? "" : "none";
+  for (const sel of ["#imgModel", "#imgAspect", "#imgQuality"]) {
+    const node = $(sel);
+    if (node) node.style.display = isImages ? "" : "none";
+  }
 }
 
 function switchSession(id) {
@@ -415,6 +726,7 @@ function switchSession(id) {
   S.studio.refItem = null;
   S.studio.refData = null;
   renderChip();
+  updateStudioChrome();
   renderList();
   loadThread().catch((err) => ($("#studioInfo").textContent = err.message));
 }
@@ -424,16 +736,34 @@ async function newSession() {
 }
 
 async function createSession(kind) {
-  const name = prompt(kind === "docs" ? "Название чата документов" : "Название чата картинок", kind === "docs" ? "Документы" : "Новый чат");
+  // видео пока не подключено: не спрашиваем имя, а сразу показываем ответ сервера
+  if (kind === "video") {
+    try {
+      await api("/api/studio/sessions", { method: "POST", body: JSON.stringify({ name: "Видео", kind }) });
+    } catch (err) {
+      const info = $("#studioInfo");
+      if (info) info.textContent = err.message;
+      else alert(err.message);
+    }
+    return;
+  }
+  const titles = { images: ["Название чата картинок", "Новый чат"], docs: ["Название чата документов", "Документы"], specs: ["Название чата спек", "Новая спека"], prompts: ["Название чата промтов", "Новые промты"] };
+  const [title, fallback] = titles[kind] ?? ["Название чата", "Новый чат"];
+  const name = prompt(title, fallback);
   if (name == null) return;
   try {
     const j = await api("/api/studio/sessions", { method: "POST", body: JSON.stringify({ name, kind }) });
-    S.studio.sessions = j.sessions;
+    S.studio.view = "all";
+    writeLocal(STUDIO_VIEW_KEY, "all");
+    S.studio.sessions = j.sessions ?? [];
     S.studio.activeId = j.activeId;
     renderList();
     await loadThread();
+    updateStudioChrome();
   } catch (err) {
-    $("#studioInfo").textContent = err.message;
+    const info = $("#studioInfo");
+    if (info) info.textContent = err.message;
+    else alert(err.message);
   }
 }
 
@@ -442,25 +772,15 @@ async function renameSession(s) {
   if (name == null) return;
   try {
     await api(`/api/studio/sessions/${s.id}`, { method: "POST", body: JSON.stringify({ name }) });
-    const { sessions } = await api("/api/studio/sessions");
-    S.studio.sessions = sessions;
-    renderList();
+    await reloadStudioSessions();
   } catch (err) {
     $("#studioInfo").textContent = err.message;
   }
 }
 
+/** Старое «удалить» теперь тоже мягкое: чат уезжает в корзину. */
 async function removeSession(s) {
-  if (!confirm(`Удалить чат «${s.name}»? Картинки останутся в файлах.`)) return;
-  try {
-    const j = await api(`/api/studio/sessions/${s.id}`, { method: "DELETE" });
-    S.studio.sessions = j.sessions;
-    S.studio.activeId = j.activeId;
-    renderList();
-    await loadThread();
-  } catch (err) {
-    $("#studioInfo").textContent = err.message;
-  }
+  await trashLibrary(s.ref ?? `chat:${s.id}`, `чат «${s.name}»`);
 }
 
 function lastResultId() {
@@ -475,58 +795,101 @@ function renderThread() {
   box.textContent = "";
   const sess = S.studio.sessions.find((s) => s.id === S.studio.activeId);
   const kind = sess?.kind ?? "images";
-  const isDocs = kind === "docs";
+  const meta = kindMeta(kind);
+  updateStudioChrome();
 
-  $("#imgPrompt").placeholder = isDocs
-    ? "Вставь текст документа — редактор вычитает или приведёт в порядок…"
-    : "Опиши, что хочешь — художник перепишет это в промт и покажет, что отправит";
-  $("#imgSend").textContent = isDocs ? "Вычитать" : "Художник";
-  const directLabel = $("#imgDirect")?.closest("label");
-  if (directLabel) directLabel.style.display = isDocs ? "none" : "";
-
+  if (kind === "video") {
+    box.append(el("div", "empty", "Видео ещё не подключено — создай чат другого типа."));
+    return;
+  }
   if (kind === "decks") {
-    box.append(el("div", "empty", "Чат «презентации» ещё в разработке — сейчас работают картинки и документы."));
+    box.append(el("div", "empty", "Чат «презентации» ещё в разработке — сейчас работают картинки, документы, спеки и промты."));
     return;
   }
 
   if (!S.studio.thread.length) {
-    box.append(
-      el(
-        "div",
-        "empty",
-        isDocs
-          ? "Вставь текст — редактор приведёт его в порядок. Короткий запрос он может переписать, большой документ только вычитает: орфография и разметка, без изменения смысла."
-          : "Опиши, что хочешь — художник перепишет это в промт, покажет, что отправит, и нарисует после твоего «Отправить»."
-      )
-    );
+    box.append(el("div", "empty", meta.empty));
+    $("#studioInfo").textContent = "";
     return;
   }
 
-  const results = S.studio.thread.filter((m) => m.role === "result" || m.role === "doc");
+  const results = S.studio.thread.filter((m) => m.role === "result" || m.role === "doc" || m.role === "prompt");
   const spent = results.reduce((s, m) => s + (m.cost || 0), 0);
-  $("#studioInfo").textContent = `${isDocs ? "документов" : "картинок"}: ${results.length} · потрачено $${spent.toFixed(3)}`;
+  const noun = kind === "images" ? "картинок" : kind === "prompts" ? "промтов" : "документов";
+  $("#studioInfo").textContent = `${noun}: ${results.length} · потрачено $${spent.toFixed(3)}`;
 
   for (const msg of S.studio.thread) {
     if (msg.role === "user") box.append(userBubble(msg));
-    else if (msg.role === "proposal" && !isDocs) box.append(proposalCard(msg));
+    else if (msg.role === "proposal" && kind === "images") box.append(proposalCard(msg));
     else if (msg.role === "result") box.append(resultCard(msg));
     else if (msg.role === "doc") box.append(docCard(msg));
+    else if (msg.role === "prompt") box.append(promptCard(msg));
   }
   box.scrollTop = box.scrollHeight;
+}
+
+/** Инлайн-правка карточки: markdown спеки/документа или текста промта. */
+function inlineEditor(card, value, onSave, rows = 10) {
+  const existing = card.querySelector(".inlineEdit");
+  if (existing) {
+    existing.querySelector("textarea")?.focus();
+    return existing;
+  }
+  const wrap = el("div", "inlineEdit");
+  const ta = el("textarea", "pText");
+  ta.value = value;
+  ta.rows = rows;
+  const row = el("div", "pRow");
+  const save = el("button", "primary", "Сохранить");
+  const cancel = el("button", "mini", "отмена");
+  cancel.addEventListener("click", () => wrap.remove());
+  save.addEventListener("click", async () => {
+    const text = ta.value.trim();
+    if (text.length < 2) {
+      ta.focus();
+      return;
+    }
+    save.disabled = true;
+    try {
+      await onSave(text);
+      wrap.remove();
+    } catch (err) {
+      alert(err.message);
+      save.disabled = false;
+    }
+  });
+  row.append(save, cancel);
+  wrap.append(ta, row);
+  card.append(wrap);
+  ta.focus();
+  return wrap;
+}
+
+async function patchStudioMessage(msg, patch) {
+  const data = await api("/api/studio/message/patch", {
+    method: "POST",
+    body: JSON.stringify({ id: msg.id, sessionId: S.studio.activeId, ...patch }),
+  });
+  if (data.thread) {
+    S.studio.thread = data.thread;
+    renderThread();
+  }
+  return data;
 }
 
 function docCard(msg) {
   const card = el("div", "docCard");
   const head = el("div", "docHead");
-  head.append(el("b", null, msg.title || "Документ"));
-  head.append(el("span", "tag", msg.mode === "correct" ? "корректор" : "помощник"));
+  head.append(el("b", null, msg.title || (msg.spec ? "Спека" : "Документ")));
+  head.append(el("span", "tag", msg.spec ? "спека" : msg.mode === "correct" ? "корректор" : "помощник"));
+  if (msg.mock) head.append(el("span", "tag mockTag", "MOCK"));
   card.append(head);
 
   if (msg.reasoning) {
     const d = document.createElement("details");
     d.className = "reasoning";
     const s = document.createElement("summary");
-    s.textContent = "что сделал редактор";
+    s.textContent = msg.spec ? "что уточнил архитектор" : "что сделал редактор";
     d.append(s, el("div", "why", msg.reasoning));
     card.append(d);
   }
@@ -539,7 +902,7 @@ function docCard(msg) {
   meta.append(
     el("span", null, `$${(msg.cost || 0).toFixed(4)}`),
     el("span", null, `${((msg.ms || 0) / 1000).toFixed(1)} с`),
-    el("span", null, new Date(msg.at).toLocaleString("ru-RU"))
+    el("span", null, msg.at ? new Date(msg.at).toLocaleString("ru-RU") : "")
   );
   card.append(meta);
 
@@ -547,15 +910,82 @@ function docCard(msg) {
   md.className = "mini link";
   md.textContent = "скачать .md";
   md.href = `/api/studio/doc/${msg.id}.md`;
+  md.download = "";
 
   const docx = document.createElement("a");
   docx.className = "mini link";
   docx.textContent = "скачать .docx";
   docx.href = `/api/studio/doc/${msg.id}.docx`;
+  docx.download = "";
 
-  card.append(actionsRow([smallBtn("удалить", "Убрать документ и всё после него", () => truncateAt(msg)), md, docx]));
+  const edit = smallBtn("править", "Отредактировать markdown вручную", () => {
+    inlineEditor(card, String(msg.markdown ?? ""), (value) => patchStudioMessage(msg, { markdown: value }));
+  });
+
+  card.append(actionsRow([edit, smallBtn("удалить", "Убрать документ и всё после него", () => truncateAt(msg)), md, docx]));
   return card;
 }
+
+function promptCard(msg) {
+  const card = el("div", "docCard promptCard");
+  const head = el("div", "docHead");
+  head.append(el("b", null, msg.title || "Промт"));
+  head.append(el("span", "tag", "промт"));
+  if (msg.mock) head.append(el("span", "tag mockTag", "MOCK"));
+  card.append(head);
+
+  if (msg.reasoning) {
+    const d = document.createElement("details");
+    d.className = "reasoning";
+    const s = document.createElement("summary");
+    s.textContent = "как понял задачу";
+    d.append(s, el("div", "why", msg.reasoning));
+    card.append(d);
+  }
+
+  const pre = el("pre", "codeBlock");
+  pre.append(el("code", null, String(msg.text ?? "")));
+  card.append(pre);
+
+  if (Array.isArray(msg.questions) && msg.questions.length) {
+    const d = document.createElement("details");
+    d.className = "reasoning";
+    d.append(el("summary", null, "уточняющие вопросы"), el("div", "why", msg.questions.map((q) => `• ${q}`).join("\n")));
+    card.append(d);
+  }
+
+  const meta = el("div", "meta");
+  meta.append(
+    el("span", null, msg.model || "artist"),
+    el("span", null, `$${(msg.cost || 0).toFixed(4)}`),
+    el("span", null, `${((msg.ms || 0) / 1000).toFixed(1)} с`),
+    el("span", null, msg.at ? new Date(msg.at).toLocaleString("ru-RU") : "")
+  );
+  card.append(meta);
+
+  const copy = smallBtn("копировать", "Скопировать промт в буфер обмена", async () => {
+    try {
+      await navigator.clipboard.writeText(String(msg.text ?? ""));
+      copy.textContent = "скопировано";
+      setTimeout(() => (copy.textContent = "копировать"), 1600);
+    } catch {
+      copy.textContent = "не скопировалось";
+    }
+  });
+  const refine = smallBtn("доработать", "Следующим сообщением попросите поправить промт", () => {
+    const input = $("#imgPrompt");
+    input.value = "";
+    input.placeholder = "Что поправить в промте? Например: «сделай короче и добавь формат ответа»";
+    input.focus();
+  });
+  const edit = smallBtn("править", "Отредактировать текст промта вручную", () => {
+    inlineEditor(card, String(msg.text ?? ""), (value) => patchStudioMessage(msg, { text: value }), 8);
+  });
+
+  card.append(actionsRow([copy, refine, edit, smallBtn("удалить", "Убрать промт и всё после него", () => truncateAt(msg))]));
+  return card;
+}
+
 
 /* общая обёртка для вызовов студии, чтобы не дублировать обновление треда */
 async function studioCall(path, body) {
@@ -628,8 +1058,11 @@ function editUserMessage(msg, wrap) {
     save.disabled = true;
     try {
       const sess = S.studio.sessions.find((s) => s.id === S.studio.activeId);
+      const kind = sess?.kind ?? "images";
       await studioCall("/api/studio/edit", { id: msg.id, text });
-      if (sess?.kind === "docs") await studioCall("/api/studio/doc", { text });
+      if (kind === "docs") await studioCall("/api/studio/doc", { text });
+      else if (kind === "specs") await studioCall("/api/studio/spec", { text });
+      else if (kind === "prompts") await studioCall("/api/studio/prompt", { text });
       else await studioCall("/api/studio/propose", { text });
     } catch (err) {
       $("#studioInfo").textContent = err.message;
@@ -833,12 +1266,19 @@ async function sendStudio() {
   const direct = $("#imgDirect").checked;
   const btn = $("#imgSend");
   const sess = S.studio.sessions.find((s) => s.id === S.studio.activeId);
+  const kind = sess?.kind ?? "images";
 
-  if (sess?.kind === "docs") {
+  const textChats = {
+    docs: ["/api/studio/doc", "редактор работает…"],
+    specs: ["/api/studio/spec", "архитектор пишет спеку…"],
+    prompts: ["/api/studio/prompt", "промт-инженер думает…"],
+  };
+  if (textChats[kind]) {
+    const [path, status] = textChats[kind];
     btn.disabled = true;
-    $("#studioInfo").innerHTML = '<span class="spin"></span> редактор работает…';
+    $("#studioInfo").innerHTML = `<span class="spin"></span> ${status}`;
     try {
-      await studioCall("/api/studio/doc", { text });
+      await studioCall(path, { text });
       $("#imgPrompt").value = "";
       renderThread();
     } catch (err) {
@@ -846,6 +1286,11 @@ async function sendStudio() {
     } finally {
       btn.disabled = false;
     }
+    return;
+  }
+
+  if (kind === "video") {
+    $("#studioInfo").textContent = "Видео ещё не подключено";
     return;
   }
 
@@ -921,6 +1366,12 @@ async function anotherProposal(msg) {
 let galleryTimer = null;
 let gallerySeq = 0;
 
+async function setGalleryView(view) {
+  S.gallery.view = libViewValue(view);
+  writeLocal(GALLERY_VIEW_KEY, S.gallery.view);
+  await loadGallery();
+}
+
 async function loadGallery() {
   const box = $("#galleryGrid");
   if (!box) return;
@@ -928,9 +1379,9 @@ async function loadGallery() {
   const q = ($("#galleryFilter")?.value ?? "").trim();
   box.textContent = "…";
   try {
-    const data = await api(`/api/gallery?limit=300${q ? `&q=${encodeURIComponent(q)}` : ""}`);
+    const data = await api(`/api/gallery?limit=300&view=${encodeURIComponent(S.gallery.view)}${q ? `&q=${encodeURIComponent(q)}` : ""}`);
     if (seq !== gallerySeq) return; // пришёл ответ на старый фильтр
-    S.gallery = { items: data.items ?? [], total: data.total ?? 0, cost: data.cost ?? 0, q };
+    S.gallery = { items: data.items ?? [], total: data.total ?? 0, cost: data.cost ?? 0, q, view: S.gallery.view };
     renderGallery();
     renderList();
   } catch (err) {
@@ -942,12 +1393,25 @@ function renderGallery() {
   const box = $("#galleryGrid");
   if (!box) return;
   box.textContent = "";
-  const { items, total, cost, q } = S.gallery;
+  const { items, total, cost, q, view } = S.gallery;
+
+  const views = $("#galleryViews");
+  if (views) {
+    views.textContent = "";
+    views.append(libViewSwitch(view, setGalleryView, false));
+  }
+
   const shown = items.length !== total ? `${items.length} из ${total}` : String(items.length);
   $("#galleryInfo").textContent = `${shown} картинок · $${Number(cost || 0).toFixed(3)}`;
 
   if (!items.length) {
-    box.append(el("div", "empty", q ? "По фильтру ничего нет." : "Картинок пока нет — сгенерируй первую в разделе «Картинки»."));
+    const empty = {
+      all: q ? "По фильтру ничего нет." : "Картинок пока нет — сгенерируй первую в разделе «Студия».",
+      fav: "В избранном пока нет картинок.",
+      archive: "Архив пуст.",
+      trash: "Корзина пуста.",
+    }[view];
+    box.append(el("div", "empty", empty));
     return;
   }
 
@@ -970,6 +1434,7 @@ function renderGallery() {
       el("span", null, `$${Number(item.cost || 0).toFixed(3)}`),
       el("span", null, item.at ? new Date(item.at).toLocaleDateString("ru-RU") : "—")
     );
+    if (item.deletedAt) meta.append(el("span", "libDeleted", `удалён ${dateShort(item.deletedAt)}`));
 
     const acts = el("div", "galleryActs");
     const open = document.createElement("a");
@@ -980,11 +1445,16 @@ function renderGallery() {
     open.rel = "noopener";
     acts.append(open);
 
-    if (S.role === "admin" || S.role === "editor") {
-      const del = el("button", "mini danger", "удалить");
-      del.dataset.write = "";
-      del.addEventListener("click", () => deleteGalleryItem(item, del));
-      acts.append(del);
+    if (canWrite()) {
+      if (item.deletedAt) {
+        acts.append(smallBtn("восстановить", "Вернуть картинку из корзины", () => restoreLibrary(item.ref)));
+        acts.append(
+          smallBtn("удалить навсегда", "Удалить запись и файл физически", () => purgeLibrary(item.ref, `картинку «${(item.prompt || item.file).slice(0, 40)}»`), "mini danger")
+        );
+      } else {
+        acts.append(starButton(item.ref, Boolean(item.fav)));
+        acts.append(libraryMenu(item.ref, { archived: Boolean(item.archived) }));
+      }
     }
 
     body.append(prompt, meta, acts);
@@ -993,16 +1463,9 @@ function renderGallery() {
   }
 }
 
-async function deleteGalleryItem(item, btn) {
-  if (!confirm(`Удалить картинку «${(item.prompt || item.file).slice(0, 60)}»?\nЗапись исчезнет из галереи, файл ${item.file} будет удалён.`)) return;
-  btn.disabled = true;
-  try {
-    await api(`/api/images/${item.id}`, { method: "DELETE" });
-    await loadGallery();
-  } catch (err) {
-    alert(err.message);
-    btn.disabled = false;
-  }
+/** Совместимость со старыми вызовами: физическое удаление теперь только через purge библиотеки. */
+async function deleteGalleryItem(item) {
+  await trashLibrary(item.ref ?? `image:${item.id}`, `картинку «${(item.prompt || item.file).slice(0, 60)}»`);
 }
 
 /* -------------------------------- ключи -------------------------------- */
@@ -2100,13 +2563,36 @@ function renderBlocks(run) {
     const card = el("div", "block");
     card.append(el("span", "id", b.id));
     const mid = el("div");
-    mid.append(el("div", "t", b.title));
+    const titleRow = el("div", "t", b.title);
+    if (b.needsRecheck) {
+      // блок уже был принят, но его общий файл поправил другой блок — нужна повторная проверка
+      const mark = el("span", "tag", "⚠ проверка после правок");
+      mark.style.marginLeft = "7px";
+      mark.style.color = "var(--warn)";
+      mark.style.borderColor = "#4a3a1c";
+      mark.style.background = "#211a0e";
+      titleRow.append(mark);
+    }
+    mid.append(titleRow);
     const meta = [];
     if (b.files?.length) meta.push(`файлов: ${b.files.length}`);
     if (b.fixCount) meta.push(`правок: ${b.fixCount}`);
     if (b.test?.verdict) meta.push(`тест: ${b.test.verdict}`);
-    if (b.manual?.decision) meta.push(b.manual.decision === "accept" ? "принят вручную" : "возвращён вручную");
+    if (Number(b.fallbacks) > 0) meta.push(`подмен модели: ${b.fallbacks}`);
+    if (Number(b.rechecks) > 0) meta.push(`перепроверок: ${b.rechecks}`);
+    if (b.manual?.decision) {
+      meta.push(
+        b.manual.decision !== "accept" ? "возвращён вручную" : b.manual.auto === true ? "принят автоматически" : "принят вручную"
+      );
+    }
     mid.append(el("div", "g", meta.join(" · ") || b.goal || ""));
+    if (Array.isArray(b.integrityWarnings) && b.integrityWarnings.length) {
+      const warn = el("div", "g", "⚠ целостность: " + b.integrityWarnings.join("; "));
+      warn.style.color = "var(--warn)";
+      warn.style.fontSize = "11px";
+      warn.style.whiteSpace = "normal";
+      mid.append(warn);
+    }
     card.append(mid, el("span", "st " + b.status, b.status));
     if (canDecide) card.append(blockDecisionRow(run, b));
     box.append(card);
@@ -2899,6 +3385,9 @@ $("#searchInput").addEventListener("keydown", (e) => {
   if (e.key === "Enter") runSearch();
 });
 $("#galleryRefresh").addEventListener("click", () => loadGallery());
+document.addEventListener("click", () => {
+  document.querySelectorAll(".itemMenu:not(.hidden)").forEach((m) => m.classList.add("hidden"));
+});
 $("#galleryFilter").addEventListener("input", () => {
   clearTimeout(galleryTimer);
   galleryTimer = setTimeout(() => loadGallery(), 220);

@@ -13,8 +13,9 @@ import { listModels, chat } from "./lib/openrouter.mjs";
 import { diffWorkspaces } from "./lib/diff.mjs";
 import { agentMetrics, verdictSummary } from "./lib/metrics.mjs";
 import { Mailbox } from "./lib/mailbox.mjs";
-import { collectAlerts } from "./lib/watch.mjs";
+import { collectAlerts, resumeWatch, saveWatchState } from "./lib/watch.mjs";
 import { Studio, generateImage, listImageModels } from "./lib/studio.mjs";
+import { Library, normalizeView, parseRef, matchesView } from "./lib/library.mjs";
 import { buildProjectZip } from "./lib/zip-pack.mjs";
 import { Keys, PRESETS } from "./lib/keys.mjs";
 import {
@@ -168,10 +169,264 @@ syncKeyToEnv();
 
 const mailbox = new Mailbox(ROOT);
 const studio = new Studio(ROOT);
+const library = new Library(studio.dir);
+
+/* ------------------------- типы чатов и библиотека ------------------------- */
+
+function sessionRef(id) {
+  return `chat:${id}`;
+}
+
+function imageRef(id) {
+  return `image:${id}`;
+}
+
+function docRef(id) {
+  return `doc:${id}`;
+}
+
+/** Чат + его пометки из библиотеки (fav/archived/deletedAt/ref). */
+function sessionWithLibrary(s) {
+  return { ...s, ref: sessionRef(s.id), ...library.state(sessionRef(s.id)) };
+}
+
+/** Список чатов выбранного вида: all — активные, archive — архив, trash — корзина. */
+function sessionsForView(rawView) {
+  const view = normalizeView(rawView);
+  return studio
+    .listSessions()
+    .map(sessionWithLibrary)
+    .filter((s) => matchesView(s, view));
+}
+
+/** Активный чат, если он виден в текущем виде; иначе первый из списка. */
+function activeIdForView(sessions) {
+  if (studio.activeId && sessions.some((s) => s.id === studio.activeId)) return studio.activeId;
+  return sessions[0]?.id ?? null;
+}
+
+/** Все сущности библиотеки: чаты, картинки и markdown-документы/спеки. */
+function libraryCatalog() {
+  const out = [];
+  const seenDocs = new Set();
+
+  for (const s of studio.sessions) {
+    const msgs = studio.readThread(s.id);
+    const state = library.state(sessionRef(s.id));
+    out.push({
+      ref: sessionRef(s.id),
+      type: "chat",
+      id: s.id,
+      ...state,
+      title: s.name,
+      kind: s.kind,
+      createdAt: s.createdAt ?? null,
+      at: s.createdAt ?? null,
+      messages: msgs.length,
+      results: msgs.filter((m) => m.role === "result").length,
+    });
+    for (const m of msgs) {
+      if (m.role !== "doc" || seenDocs.has(m.id)) continue;
+      seenDocs.add(m.id);
+      const stateDoc = library.state(docRef(m.id));
+      out.push({
+        ref: docRef(m.id),
+        type: "doc",
+        id: m.id,
+        ...stateDoc,
+        title: m.title || "Документ",
+        sessionId: s.id,
+        kind: m.spec ? "spec" : "doc",
+        at: m.at ?? null,
+      });
+    }
+  }
+
+  for (const item of studio.items) {
+    const state = library.state(imageRef(item.id));
+    out.push({
+      ref: imageRef(item.id),
+      type: "image",
+      id: item.id,
+      ...state,
+      title: item.prompt || item.file,
+      prompt: item.prompt ?? "",
+      file: item.file,
+      url: `/studio/${item.file}`,
+      model: item.model ?? null,
+      mediaType: item.mediaType ?? null,
+      cost: Number(item.cost ?? 0),
+      at: item.at ?? null,
+    });
+  }
+
+  out.sort((a, b) => String(b.at ?? "").localeCompare(String(a.at ?? "")));
+  return out;
+}
+
+function libraryEntries(rawView) {
+  const view = normalizeView(rawView);
+  return libraryCatalog().filter((entry) => matchesView(entry, view));
+}
+
+function libraryCounts() {
+  const counts = { all: 0, fav: 0, archive: 0, trash: 0 };
+  for (const entry of libraryCatalog()) {
+    for (const view of ["all", "fav", "archive", "trash"]) if (matchesView(entry, view)) counts[view]++;
+  }
+  return counts;
+}
+
+/** Существует ли объект, на который указывает ссылка библиотеки. */
+function refExists(ref) {
+  const { type, id } = parseRef(ref);
+  if (type === "chat") return studio.sessions.some((s) => s.id === id);
+  if (type === "image") return Boolean(studio.get(id));
+  const found = studio.findMessage(id);
+  return Boolean(found && found.message.role === "doc");
+}
+
+/** Физическое удаление по ссылке библиотеки. */
+function purgeRef(ref) {
+  const { type, id } = parseRef(ref);
+
+  if (type === "chat") {
+    const session = studio.sessions.find((s) => s.id === id);
+    if (session) {
+      // документы и спеки этого чата больше нигде не нужны — чистим и их пометки
+      for (const m of studio.readThread(id)) {
+        if (m.role === "doc") library.remove(docRef(m.id));
+      }
+      studio.removeSession(id);
+      const visible = sessionsForView("all");
+      if (!visible.some((s) => s.id === studio.activeId)) {
+        studio.activeId = visible[0]?.id ?? null;
+        studio.saveSessions();
+      }
+    }
+    library.remove(ref);
+    return { ref, type, removed: Boolean(session), activeId: studio.activeId };
+  }
+
+  if (type === "image") {
+    const item = studio.get(id);
+    let removed = false;
+    if (item) {
+      const file = path.resolve(studio.filePath(item));
+      const dir = path.resolve(studio.dir) + path.sep;
+      if (!file.startsWith(dir)) throw new Error("Файл картинки вне каталога студии");
+      try {
+        if (fs.existsSync(file)) fs.rmSync(file, { force: true });
+      } catch (err) {
+        throw new Error(`Файл не удалился: ${String(err?.message || err)}`);
+      }
+      studio.items = studio.items.filter((i) => i.id !== item.id);
+      studio.save();
+      removed = true;
+    }
+    library.remove(ref);
+    return { ref, type, removed };
+  }
+
+  // doc
+  const found = studio.findMessage(id);
+  let removed = false;
+  if (found && found.message.role === "doc") {
+    studio.removeMessage(id, found.session.id);
+    removed = true;
+  }
+  library.remove(ref);
+  return { ref, type, removed };
+}
+
+function sessionKindOf(sid) {
+  return studio.sessions.find((s) => s.id === sid)?.kind ?? "images";
+}
+
+/* ---------------------- новые типы чатов: спеки и промты ---------------------- */
+
+const PROMPT_ENGINEER_SYSTEM =
+  "Ты — промт-инженер для текстовых задач (НЕ для картинок). Заказчик пишет по-русски поверхностно: " +
+  "превращаешь это в готовый промт для языковой модели или другого ИИ: роль, цель, контекст, входные данные, " +
+  "ограничения, формат ответа, критерии качества. Если задача неясна — сначала задай 1–3 коротких вопроса в поле questions. " +
+  "Промт пиши так, чтобы его можно было скопировать и вставить как есть. Если заказчик просит доработать — сохраняй удачное " +
+  "из прошлой версии и меняй только то, о чём попросили. Отвечай строго JSON.";
+
+function specPromptFor(previous, request) {
+  const base = previous
+    ? `Текущая версия спеки (её нужно доработать, а не писать с нуля):\n"""\n${previous}\n"""\n\n`
+    : "";
+  return `${base}Запрос заказчика: ${request}\n\nВерни СТРОГО JSON: {"title":"короткое название спеки по-русски","markdown":"полная спека в markdown: что входит, чего не входит, критерии приёмки, зависимости, открытые вопросы","reasoning":"2–4 предложения по-русски, что уточнил и почему"}`;
+}
+
+function textPromptFor(previous, request) {
+  const hist = previous
+    ? `Предыдущая версия промта:\n"""\n${previous}\n"""\n\nЗапрос на доработку: ${request}`
+    : `Запрос заказчика: ${request}`;
+  return `${hist}\n\nВерни СТРОГО JSON: {"title":"короткое название промта по-русски","prompt":"готовый промт целиком, в markdown","reasoning":"2–4 предложения по-русски, как понял задачу и что уточнить","questions":["необязательные уточняющие вопросы"]}`;
+}
+
+function lastDocMarkdown(sid) {
+  const thread = studio.threadList(sid, 60);
+  for (let i = thread.length - 1; i >= 0; i--) {
+    const m = thread[i];
+    if (m.role === "doc") return String(m.markdown ?? "");
+  }
+  return "";
+}
+
+function lastPromptText(sid) {
+  const thread = studio.threadList(sid, 80);
+  for (let i = thread.length - 1; i >= 0; i--) {
+    const m = thread[i];
+    if (m.role === "prompt") return String(m.text ?? "");
+  }
+  return "";
+}
+
+/** Заглушка спеки для MOCK: проверка структуры без ключа и без трат. */
+function mockSpecCard(text) {
+  const first = text.split(/\r?\n/).find((line) => line.trim())?.trim() ?? "Спека";
+  const title = `Спека (MOCK): ${first.slice(0, 60)}`;
+  return {
+    title,
+    markdown: `# ${title}\n\n## Цель\n${first}\n\n## Что входит\n- Минимальная версия по описанию заказчика.\n\n## Чего НЕ входит\n- Всё, что не описано явно.\n\n## Критерии приёмки\n- [ ] Поведение соответствует описанию.\n\n## Открытые вопросы\n- MOCK-режим: реальная модель не вызывалась.\n`,
+    reasoning: "MOCK-режим: архитектор не вызывался, показана заглушка структуры спеки.",
+  };
+}
+
+/** Заглушка текстового промта для MOCK. */
+function mockPromptCard(text) {
+  const first = text.split(/\r?\n/).find((line) => line.trim())?.trim() ?? "Задача";
+  return {
+    title: `Промт (MOCK): ${first.slice(0, 60)}`,
+    prompt: `Ты — помощник, который решает задачу заказчика.\n\n## Задача\n${first}\n\n## Контекст\n(опиши входные данные)\n\n## Ограничения\n- Не выдумывай факты.\n- Если данных не хватает — задай вопрос.\n\n## Формат ответа\nКороткий ответ, затем обоснование списком.\n\n<!-- MOCK: реальная модель не вызывалась -->`,
+    reasoning: "MOCK-режим: промт-инженер не вызывался, показана заглушка готового промта.",
+  };
+}
+
 let harness = readJson(path.join(CONFIG_DIR, "harness.json"));
 
-/* ---------- дежурный: интервал в памяти процесса, ничего не пишем в конфиг ---------- */
+/* ---------- дежурный: состояние переживает рестарт (runs/watch.state.json) ---------- */
 const watch = { running: false, everyMin: 10, lastRunAt: null, lastAlerts: [], timer: null };
+
+/** Один таймер дежурного: старый гасим, чтобы не плодить параллельные проверки. */
+function startWatchTimer(everyMin = watch.everyMin) {
+  if (watch.timer) clearInterval(watch.timer);
+  watch.everyMin = Math.min(1440, Math.max(1, Math.floor(Number(everyMin) || 10)));
+  watch.timer = setInterval(runWatchCheck, watch.everyMin * 60_000);
+  watch.timer.unref?.();
+  return watch.timer;
+}
+
+// при старте возвращаем сохранённое состояние; если дежурный был включён — сразу поднимаем таймер
+try {
+  const saved = resumeWatch({ runsDir: store.runsDir });
+  Object.assign(watch, saved);
+  if (watch.running) startWatchTimer(watch.everyMin);
+} catch (err) {
+  console.error("[watch] не удалось восстановить состояние:", String(err?.message || err));
+}
 
 /* ---------- что будит Харнесса: события портала → почтовый ящик ---------- */
 bus.on("event", ({ runId, entry }) => {
@@ -260,6 +515,17 @@ const readBody = (req, limit = 2_000_000) =>
     req.on("error", reject);
   });
 
+/** Пометки блока из engine: подмены модели, повторная проверка, авто-приём, целостность. */
+function blockStateFields(b = {}) {
+  return {
+    fallbacks: Number(b.fallbacks ?? 0),
+    needsRecheck: b.needsRecheck === true,
+    autoAccepted: b.autoAccepted === true,
+    integrityWarnings: Array.isArray(b.integrityWarnings) ? b.integrityWarnings.slice(-5) : [],
+    rechecks: Number(b.rechecks ?? 0),
+  };
+}
+
 function snapshot(run) {
   return {
     id: run.id,
@@ -275,6 +541,7 @@ function snapshot(run) {
     stageIndex: run.stageIndex,
     awaiting: run.awaiting,
     plan: run.plan,
+    fallbacks: Number(run.fallbacks ?? 0),
     blocks: (run.blocks ?? []).map((b) => ({
       id: b.id,
       title: b.title,
@@ -287,6 +554,7 @@ function snapshot(run) {
       test: b.test ? { verdict: b.test.verdict, summary: b.test.summary, defects: b.test.defects, round: b.test.round } : null,
       fixCount: b.fixes?.length ?? 0,
       files: (b.files ?? []).map((f) => f.path),
+      ...blockStateFields(b),
     })),
     usage: run.usage,
     error: run.error,
@@ -371,6 +639,8 @@ function runWatchCheck() {
     runId: a.runId ?? null,
     projectId: a.projectId ?? null,
   }));
+  // состояние дежурного переживает рестарт: сохраняем после каждого круга
+  saveWatchState(watch, { runsDir: store.runsDir });
 
   bus.emit("watch", { ...watchSnapshot(), added: added.length, lastAdded: added.slice(-5) });
   return added.length;
@@ -380,6 +650,7 @@ function stopWatch() {
   if (watch.timer) clearInterval(watch.timer);
   watch.timer = null;
   watch.running = false;
+  saveWatchState(watch, { runsDir: store.runsDir });
   return watchSnapshot();
 }
 
@@ -715,12 +986,25 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (pathname === "/api/state" && req.method === "GET") {
+      // к сводке прогона добавляем пометки блоков: UI и проверки видят fallbacks/recheck/auto/integrity
+      const runs = store.list().map((r) => {
+        try {
+          const full = store.load(r.id);
+          return {
+            ...r,
+            fallbacks: Number(full.fallbacks ?? 0),
+            blocks: (full.blocks ?? []).map((b) => ({ id: b.id, ...blockStateFields(b) })),
+          };
+        } catch {
+          return { ...r, fallbacks: 0, blocks: [] };
+        }
+      });
       return json(res, 200, {
         mode: isMock() ? "mock" : "live",
         port: PORT,
         agents: config.agents,
         pipeline: config.pipeline,
-        runs: store.list(),
+        runs,
         projects: projectList(),
       });
     }
@@ -978,6 +1262,7 @@ const server = http.createServer(async (req, res) => {
 
       const imagesHit = studio
         .list(300)
+        .filter((i) => !library.isDeleted(imageRef(i.id)))
         .filter((i) => (i.prompt ?? "").toLowerCase().includes(q))
         .slice(0, 12)
         .map((i) => ({ id: i.id, file: i.file, prompt: i.prompt.slice(0, 140), cost: i.cost }));
@@ -1017,11 +1302,10 @@ const server = http.createServer(async (req, res) => {
       const base = Number.isFinite(raw) ? Math.floor(raw) : watch.everyMin;
       const everyMin = Math.min(1440, Math.max(1, base));
       watch.everyMin = everyMin;
-      if (watch.timer) clearInterval(watch.timer);
       watch.running = true;
       runWatchCheck(); // первый круг сразу — иначе непонятно, жив ли дежурный
-      watch.timer = setInterval(runWatchCheck, everyMin * 60_000);
-      watch.timer.unref?.();
+      startWatchTimer(everyMin);
+      saveWatchState(watch, { runsDir: store.runsDir }); // интервал и running — на диск
       return json(res, 200, watchSnapshot());
     }
 
@@ -1139,14 +1423,80 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { harness });
     }
 
+    /* ---------- библиотека: избранное / архив / корзина ---------- */
+
+    if (pathname === "/api/library" && method === "GET") {
+      const view = normalizeView(url.searchParams.get("view"));
+      return json(res, 200, { view, items: libraryEntries(view), counts: libraryCounts() });
+    }
+
+    const markRef = (body) => {
+      const { ref } = parseRef(body.ref);
+      if (!refExists(ref)) throw Object.assign(new Error("Объект не найден"), { code: 404 });
+      return ref;
+    };
+
+    if (pathname === "/api/library/mark" && method === "POST") {
+      const body = await readBody(req);
+      try {
+        const ref = markRef(body);
+        if (body.fav === undefined && body.archived === undefined) return json(res, 400, { error: "Укажи fav или archived" });
+        const patch = {};
+        if (body.fav !== undefined) patch.fav = Boolean(body.fav);
+        if (body.archived !== undefined) patch.archived = Boolean(body.archived);
+        const state = library.mark(ref, patch);
+        return json(res, 200, { ok: true, ref, item: { ref, ...state } });
+      } catch (err) {
+        return json(res, err.code ?? 400, { error: String(err.message) });
+      }
+    }
+
+    if (pathname === "/api/library/trash" && method === "POST") {
+      const body = await readBody(req);
+      try {
+        const ref = markRef(body);
+        const state = library.trash(ref);
+        return json(res, 200, { ok: true, ref, item: { ref, ...state } });
+      } catch (err) {
+        return json(res, err.code ?? 400, { error: String(err.message) });
+      }
+    }
+
+    if (pathname === "/api/library/restore" && method === "POST") {
+      const body = await readBody(req);
+      try {
+        const ref = markRef(body);
+        const state = library.restore(ref);
+        return json(res, 200, { ok: true, ref, item: { ref, ...state } });
+      } catch (err) {
+        return json(res, err.code ?? 400, { error: String(err.message) });
+      }
+    }
+
+    if (pathname === "/api/library/purge" && method === "DELETE") {
+      const body = await readBody(req).catch(() => ({}));
+      try {
+        const { ref } = parseRef(body.ref);
+        const out = purgeRef(ref);
+        return json(res, 200, { ok: true, ...out });
+      } catch (err) {
+        return json(res, err.code ?? 400, { error: String(err.message) });
+      }
+    }
+
     if (pathname === "/api/studio/sessions" && req.method === "GET") {
-      return json(res, 200, { sessions: studio.listSessions(), activeId: studio.activeId });
+      const view = normalizeView(url.searchParams.get("view"));
+      const sessions = sessionsForView(view);
+      return json(res, 200, { sessions, activeId: activeIdForView(sessions), view, counts: libraryCounts() });
     }
 
     if (pathname === "/api/studio/sessions" && req.method === "POST") {
       const body = await readBody(req);
-      const session = studio.createSession({ name: body.name, kind: body.kind });
-      return json(res, 200, { session, sessions: studio.listSessions(), activeId: studio.activeId });
+      const kind = String(body.kind ?? "images");
+      if (kind === "video") return json(res, 400, { error: "Видео ещё не подключено — такой тип чата пока не работает." });
+      if (!["images", "docs", "specs", "prompts"].includes(kind)) return json(res, 400, { error: `Неизвестный тип чата: ${kind}` });
+      const session = studio.createSession({ name: body.name, kind });
+      return json(res, 200, { session: sessionWithLibrary(session), sessions: sessionsForView("all"), activeId: studio.activeId, view: "all" });
     }
 
     if (pathname === "/api/studio/thread" && req.method === "GET") {
@@ -1154,7 +1504,8 @@ const server = http.createServer(async (req, res) => {
       try {
         const thread = studio.threadList(sid, 80); // внутри проверяется существование чата
         if (sid) studio.activeId = sid;
-        return json(res, 200, { thread, activeId: studio.activeId });
+        const session = studio.sessions.find((s) => s.id === (sid ?? studio.activeId)) ?? null;
+        return json(res, 200, { thread, activeId: studio.activeId, session: session ? sessionWithLibrary(session) : null });
       } catch (err) {
         return json(res, 404, { error: String(err.message) });
       }
@@ -1165,15 +1516,23 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       try {
         const session = studio.renameSession(sm[1], body.name);
-        return json(res, 200, { session, sessions: studio.listSessions() });
+        return json(res, 200, { session: sessionWithLibrary(session), sessions: sessionsForView("all") });
       } catch (err) {
         return json(res, 404, { error: String(err.message) });
       }
     }
     if (sm && req.method === "DELETE") {
+      // обычное «удалить» в студии теперь мягкое: чат уезжает в корзину библиотеки
       try {
-        const out = studio.deleteSession(sm[1]);
-        return json(res, 200, out);
+        const id = studio.assertSession(sm[1]);
+        const state = library.trash(sessionRef(id));
+        const sessions = sessionsForView("all");
+        const activeId = activeIdForView(sessions);
+        if (studio.activeId === id) {
+          studio.activeId = activeId;
+          studio.saveSessions();
+        }
+        return json(res, 200, { ok: true, trashed: true, ref: sessionRef(id), deletedAt: state.deletedAt, sessions, activeId });
       } catch (err) {
         return json(res, 400, { error: String(err.message) });
       }
@@ -1181,9 +1540,17 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === "/api/studio/doc" && req.method === "POST") {
       const body = await readBody(req, 2_000_000);
-      const sid = body.sessionId ?? undefined;
       const text = String(body.text ?? "").trim();
       if (text.length < 2) return json(res, 400, { error: "Пустой текст" });
+
+      let sid;
+      try {
+        sid = studio.assertSession(body.sessionId ?? undefined);
+      } catch (err) {
+        return json(res, 404, { error: String(err.message) });
+      }
+      if (sessionKindOf(sid) !== "docs") return json(res, 409, { error: "Этот чат не для документов — создайте чат «Документы»" });
+      if (library.isDeleted(sessionRef(sid))) return json(res, 409, { error: "Чат в корзине — сначала восстановите его" });
       if (isMock()) return json(res, 502, { error: "MOCK-режим: редактор не работает без ключа" });
 
       // «грань»: большой документ правим только по орфографии, короткий запрос — можно переписать
@@ -1217,6 +1584,157 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { message: msg, thread: studio.threadList(sid, 80) });
       } catch (err) {
         return json(res, 502, { error: String(err?.message || err) });
+      }
+    }
+
+    /* ---------- спеки: архитектор пишет и дорабатывает ТЗ ---------- */
+
+    if (pathname === "/api/studio/spec" && req.method === "POST") {
+      const body = await readBody(req, 2_000_000);
+      const text = String(body.text ?? "").trim();
+      if (text.length < 2) return json(res, 400, { error: "Пустой текст" });
+
+      let sid;
+      try {
+        sid = studio.assertSession(body.sessionId ?? undefined);
+      } catch (err) {
+        return json(res, 404, { error: String(err.message) });
+      }
+      if (sessionKindOf(sid) !== "specs") return json(res, 409, { error: "Этот чат не для спек — создайте чат «Спеки»" });
+      if (library.isDeleted(sessionRef(sid))) return json(res, 409, { error: "Чат в корзине — сначала восстановите его" });
+
+      // предыдущая спека нужна для доработки: архитектор правит её, а не пишет с нуля
+      const previous = lastDocMarkdown(sid);
+      studio.threadAdd({ role: "user", text }, sid);
+
+      if (isMock()) {
+        const stub = mockSpecCard(text);
+        const msg = studio.threadAdd(
+          { role: "doc", spec: true, mock: true, title: stub.title, markdown: stub.markdown, reasoning: stub.reasoning, cost: 0, ms: 0 },
+          sid
+        );
+        return json(res, 200, { message: msg, thread: studio.threadList(sid, 80), mock: true });
+      }
+
+      const started = Date.now();
+      try {
+        const agent = engine.agent("architect");
+        const out = await chat({
+          model: agent.model,
+          temperature: Number(agent.temperature ?? 0.2),
+          maxTokens: 6000,
+          apiKey: keys.resolve(agent.id)?.key ?? null,
+          system: `${agent.prompt}\n\nТы пишешь не код, а спеку-договор в markdown по описанию заказчика. Пиши по-русски.`,
+          user: specPromptFor(previous, text),
+        });
+        let data;
+        try {
+          data = extractJson(out.text);
+        } catch {
+          data = { markdown: out.text };
+        }
+        const markdown = String(data.markdown ?? "").trim() || String(out.text).trim();
+        const msg = studio.threadAdd(
+          {
+            role: "doc",
+            spec: true,
+            title: String(data.title ?? "Спека").slice(0, 120),
+            markdown,
+            reasoning: String(data.reasoning ?? ""),
+            cost: out.usage.cost,
+            model: out.model,
+            ms: Date.now() - started,
+          },
+          sid
+        );
+        return json(res, 200, { message: msg, thread: studio.threadList(sid, 80) });
+      } catch (err) {
+        return json(res, 502, { error: String(err?.message || err), thread: studio.threadList(sid, 80) });
+      }
+    }
+
+    /* ---------- промты: промт-инженер для текстовых задач ---------- */
+
+    if (pathname === "/api/studio/prompt" && req.method === "POST") {
+      const body = await readBody(req, 2_000_000);
+      const text = String(body.text ?? "").trim();
+      if (text.length < 2) return json(res, 400, { error: "Пустой текст" });
+
+      let sid;
+      try {
+        sid = studio.assertSession(body.sessionId ?? undefined);
+      } catch (err) {
+        return json(res, 404, { error: String(err.message) });
+      }
+      if (sessionKindOf(sid) !== "prompts") return json(res, 409, { error: "Этот чат не для промтов — создайте чат «Промты»" });
+      if (library.isDeleted(sessionRef(sid))) return json(res, 409, { error: "Чат в корзине — сначала восстановите его" });
+
+      const previous = lastPromptText(sid);
+      studio.threadAdd({ role: "user", text }, sid);
+
+      if (isMock()) {
+        const stub = mockPromptCard(text);
+        const msg = studio.threadAdd(
+          { role: "prompt", mock: true, title: stub.title, text: stub.prompt, reasoning: stub.reasoning, cost: 0, ms: 0 },
+          sid
+        );
+        return json(res, 200, { message: msg, thread: studio.threadList(sid, 80), mock: true, agent: "artist" });
+      }
+
+      const started = Date.now();
+      try {
+        // отдельный системный промт в server.mjs, модель берём у художника (ключ тот же)
+        const artist = engine.agent("artist");
+        const out = await chat({
+          model: artist.model,
+          temperature: Number(artist.temperature ?? 0.4),
+          maxTokens: 4000,
+          apiKey: keys.resolve(artist.id)?.key ?? null,
+          system: PROMPT_ENGINEER_SYSTEM,
+          user: textPromptFor(previous, text),
+        });
+        let data;
+        try {
+          data = extractJson(out.text);
+        } catch {
+          const fenced = String(out.text).match(/```(?:markdown|md|text)?\s*([\s\S]*?)```/i);
+          data = { prompt: fenced ? fenced[1] : out.text, reasoning: "" };
+        }
+        const promptText = String(data.prompt ?? "").trim() || String(out.text).trim();
+        const msg = studio.threadAdd(
+          {
+            role: "prompt",
+            title: String(data.title ?? "Промт").slice(0, 120),
+            text: promptText,
+            reasoning: String(data.reasoning ?? ""),
+            questions: Array.isArray(data.questions) ? data.questions.map(String).slice(0, 5) : [],
+            cost: out.usage.cost,
+            model: out.model,
+            ms: Date.now() - started,
+          },
+          sid
+        );
+        return json(res, 200, { message: msg, thread: studio.threadList(sid, 80), agent: "artist" });
+      } catch (err) {
+        return json(res, 502, { error: String(err?.error || err?.message || err), thread: studio.threadList(sid, 80) });
+      }
+    }
+
+    if (pathname === "/api/studio/message/patch" && req.method === "POST") {
+      const body = await readBody(req, 2_000_000);
+      const id = String(body.id ?? "");
+      if (!id) return json(res, 400, { error: "Не указано сообщение" });
+      const patch = {};
+      if (typeof body.title === "string") patch.title = body.title.slice(0, 200);
+      if (typeof body.markdown === "string") patch.markdown = body.markdown.slice(0, 200_000);
+      if (typeof body.text === "string") patch.text = body.text.slice(0, 200_000);
+      if (!Object.keys(patch).length) return json(res, 400, { error: "Нечего менять" });
+      try {
+        const sid = studio.assertSession(body.sessionId ?? undefined);
+        const message = studio.patchMessage(id, patch, sid);
+        return json(res, 200, { message, thread: studio.threadList(sid, 80) });
+      } catch (err) {
+        return json(res, 404, { error: String(err.message) });
       }
     }
 
@@ -1256,6 +1774,7 @@ const server = http.createServer(async (req, res) => {
       if (text.length < 2) return json(res, 400, { error: "Пустой запрос" });
       const sess = studio.sessions.find((s) => s.id === (sid ?? studio.activeId));
       if (sess && sess.kind !== "images") return json(res, 501, { error: `Чат типа «${sess.kind}» ещё в разработке — сейчас работает только «картинки»` });
+      if (sess && library.isDeleted(sessionRef(sess.id))) return json(res, 409, { error: "Чат в корзине — сначала восстановите его" });
       studio.threadAdd({ role: "user", text, ref: body.referenceId ?? null }, sid);
       const result = await makeProposal(text, body.referenceId ?? null, sid);
       if (result.error) return json(res, 502, { error: result.error, thread: studio.threadList(sid, 80) });
@@ -1288,6 +1807,8 @@ const server = http.createServer(async (req, res) => {
       const sid = body.sessionId ?? undefined;
       const text = String(body.text ?? "").trim();
       if (text.length < 2) return json(res, 400, { error: "Пустой запрос" });
+      const chatId = sid ?? studio.activeId;
+      if (chatId && library.isDeleted(sessionRef(chatId))) return json(res, 409, { error: "Чат в корзине — сначала восстановите его" });
       const result = await makeProposal(text, body.referenceId ?? null, sid);
       if (result.error) return json(res, 502, { error: result.error, thread: studio.threadList(sid, 80) });
       return json(res, 200, { proposal: result.proposal, thread: studio.threadList(sid, 80) });
@@ -1328,15 +1849,21 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req, 14_000_000);
       const prompt = String(body.prompt ?? "").trim();
       if (prompt.length < 2) return json(res, 400, { error: "Пустой промт" });
-      if (isMock()) return json(res, 502, { error: "MOCK-режим: картинки не генерируются без ключа" });
+      const chatId = body.sessionId ?? studio.activeId;
+      if (chatId && library.isDeleted(sessionRef(chatId))) return json(res, 409, { error: "Чат в корзине — сначала восстановите его" });
 
       const references = [];
       let refId = null;
+      let refItem = null;
       if (body.referenceId) {
-        const item = studio.get(String(body.referenceId));
-        if (!item) return json(res, 404, { error: "Референс не найден" });
-        references.push(studio.dataUrl(item));
-        refId = item.id;
+        refItem = studio.get(String(body.referenceId));
+        if (!refItem) return json(res, 404, { error: "Референс не найден" });
+        if (library.isDeleted(imageRef(refItem.id))) return json(res, 409, { error: "Референс в корзине — сначала восстановите его" });
+      }
+      if (isMock()) return json(res, 502, { error: "MOCK-режим: картинки не генерируются без ключа" });
+      if (refItem) {
+        references.push(studio.dataUrl(refItem));
+        refId = refItem.id;
       }
 
       const imgKey = keys.resolve("studio");
@@ -1403,7 +1930,13 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === "/api/images" && req.method === "GET") {
       const limit = Math.min(Number(url.searchParams.get("limit") ?? 60), 200);
-      return json(res, 200, { items: studio.list(limit) });
+      const view = normalizeView(url.searchParams.get("view") ?? "all");
+      const items = studio
+        .list(300)
+        .map((i) => ({ ...i, ref: imageRef(i.id), ...library.state(imageRef(i.id)) }))
+        .filter((i) => matchesView(i, view))
+        .slice(0, limit);
+      return json(res, 200, { items, view });
     }
 
     if (pathname === "/api/images" && req.method === "POST") {
@@ -1418,6 +1951,7 @@ const server = http.createServer(async (req, res) => {
       if (body.referenceId) {
         const item = studio.get(String(body.referenceId));
         if (!item) return json(res, 404, { error: "Референс не найден" });
+        if (library.isDeleted(imageRef(item.id))) return json(res, 409, { error: "Референс в корзине — сначала восстановите его" });
         references.push(studio.dataUrl(item));
         refId = item.id;
       } else if (typeof body.reference === "string" && body.reference.startsWith("data:image/")) {
@@ -1454,12 +1988,17 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === "/api/gallery" && method === "GET") {
       const q = String(url.searchParams.get("q") ?? "").trim().toLowerCase();
+      const view = normalizeView(url.searchParams.get("view") ?? "all");
       const raw = Number(url.searchParams.get("limit") ?? 200);
       const limit = Math.max(1, Math.min(Number.isFinite(raw) ? Math.floor(raw) : 200, 300));
-      const all = studio.list(300); // индекс студии и так не длиннее 300 записей
+      const all = studio
+        .list(300) // индекс студии и так не длиннее 300 записей
+        .map((i) => ({ ...i, ref: imageRef(i.id), ...library.state(imageRef(i.id)) }))
+        .filter((i) => matchesView(i, view));
       const filtered = q ? all.filter((i) => `${i.prompt ?? ""} ${i.model ?? ""}`.toLowerCase().includes(q)) : all;
       const items = filtered.slice(0, limit).map((i) => ({
         id: i.id,
+        ref: i.ref,
         file: i.file,
         prompt: i.prompt ?? "",
         model: i.model ?? null,
@@ -1468,12 +2007,17 @@ const server = http.createServer(async (req, res) => {
         url: `/studio/${i.file}`,
         mediaType: i.mediaType ?? null,
         aspectRatio: i.aspectRatio ?? null,
+        fav: i.fav,
+        archived: i.archived,
+        deletedAt: i.deletedAt,
       }));
       return json(res, 200, {
         items,
         total: filtered.length,
         cost: filtered.reduce((sum, i) => sum + Number(i.cost ?? 0), 0),
         limit,
+        view,
+        counts: libraryCounts(),
       });
     }
 
@@ -1491,6 +2035,7 @@ const server = http.createServer(async (req, res) => {
       }
       studio.items = studio.items.filter((i) => i.id !== item.id);
       studio.save();
+      library.remove(imageRef(item.id));
       return json(res, 200, { ok: true, id: item.id, removed: item.file });
     }
 
@@ -1694,6 +2239,7 @@ const server = http.createServer(async (req, res) => {
 async function makeProposal(text, referenceId = null, sessionId = undefined) {
   if (isMock()) return { error: "MOCK-режим: художник не работает без ключа" };
   const refItem = referenceId ? studio.get(String(referenceId)) : null;
+  if (refItem && library.isDeleted(imageRef(refItem.id))) return { error: "Референс в корзине — сначала восстановите его" };
   const refNote = refItem ? `\n\nЗаказчик приложил картинку-референс (${refItem.id}). Это запрос на правку: опиши в промте, что менять, а что оставить, и используй формулировки вроде "keep the composition".` : "";
   const models = await imageModels().catch(() => []);
   const blocked = /(vector|krea|edit|upscal|inpaint)/i;

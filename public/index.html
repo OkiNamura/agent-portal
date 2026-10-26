@@ -47,7 +47,7 @@
   <nav class="nav" id="nav">
     <button data-page="projects" class="active"><span class="ico">▣</span><span>Проекты</span></button>
     <button data-page="agents"><span class="ico">◈</span><span>Агенты</span></button>
-    <button data-page="studio"><span class="ico">✷</span><span>Картинки</span></button>
+    <button data-page="studio"><span class="ico">✷</span><span>Студия</span></button>
     <button data-page="gallery"><span class="ico">▦</span><span>Галерея</span></button>
     <button data-page="stats"><span class="ico">▤</span><span>Статистика</span></button>
     <button data-page="keys"><span class="ico">⚿</span><span>Ключи</span></button>
@@ -151,11 +151,11 @@
       <div id="agentEditor" class="agentEditor"></div>
     </div>
 
-    <!-- КАРТИНКИ -->
+    <!-- СТУДИЯ -->
     <div id="pageStudio" class="page hidden">
       <div class="pageHead">
-        <h1>Картинки</h1>
-        <div class="dim">Запрос → картинка. Следующий запрос может быть правкой: прикрепи свою картинку или нажми «переделать» на результате.</div>
+        <h1>Студия</h1>
+        <div class="dim">Чаты по типам: картинки, документы, спеки и промты. Слева — группы, избранное, архив и корзина.</div>
       </div>
       <div class="studio">
         <div class="studioBar">
@@ -197,9 +197,10 @@
     <div id="pageGallery" class="page hidden">
       <div class="pageHead">
         <h1>Галерея</h1>
-        <div class="dim">Все картинки студии: превью, промт, модель и цена. «Удалить» убирает запись из индекса и файл из studio/.</div>
+        <div class="dim">Все картинки студии: превью, промт, модель и цена. Звёздочка — в избранное, меню — в архив или корзину.</div>
       </div>
       <div class="galleryBar">
+        <div id="galleryViews" class="libViews"></div>
         <input id="galleryFilter" placeholder="Фильтр по тексту промта…" />
         <button id="galleryRefresh" class="mini">обновить</button>
         <span class="spacer"></span>
