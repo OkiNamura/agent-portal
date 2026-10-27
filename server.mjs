@@ -45,7 +45,11 @@ const PORT = Number(process.env.PORT || 7777);
 /* Одноразовый (долгоживущий) токен для статики: /studio/x.png?token=... и /preview/...?token=... */
 const PORTAL_TOKEN = String(process.env.PORTAL_TOKEN ?? "").trim();
 const PUBLIC = path.join(ROOT, "public");
-const CONFIG_DIR = path.join(ROOT, "config");
+/* CONFIG_DIR можно переопределить для проверок: снимки и настройки не должны
+   трогать боевой config/ во время прогона проб. */
+const CONFIG_DIR = process.env.CONFIG_DIR ? path.resolve(process.env.CONFIG_DIR) : path.join(ROOT, "config");
+/* Снимки состояния: по умолчанию <корень>/snapshots, для проб — временный каталог. */
+const SNAPSHOTS_DIR = process.env.SNAPSHOTS_DIR ? path.resolve(process.env.SNAPSHOTS_DIR) : path.join(ROOT, "snapshots");
 
 /* Пользователи и сессии. Первый запуск создаёт админа и печатает его пароль один раз. */
 try {
@@ -174,6 +178,66 @@ syncKeyToEnv();
 const mailbox = new Mailbox(ROOT);
 const studio = new Studio(ROOT);
 const library = new Library(studio.dir);
+
+/* ------------------- классификация углового чата ------------------- */
+
+/*
+ * У каждой почты/алерта есть tab: critical | notice | chat.
+ * Явное поле tab главнее; старые записи без него раскладываем по kind/level.
+ * Ошибки прогонов и алерты уровня error/bad — в «Критичное», переписка —
+ * в «Чат», всё остальное (гейты, завершения, предупреждения) — в «Оповещения».
+ */
+const MAIL_TABS = Object.freeze(["critical", "notice", "chat"]);
+const CRITICAL_MAIL_KINDS = new Set(["error", "call_failed", "stop", "stopped", "fail", "failed", "crash", "crashed"]);
+
+function classifyMailTab(item = {}) {
+  if (MAIL_TABS.includes(item.tab)) return item.tab;
+  const kind = String(item.kind ?? "").toLowerCase();
+  const level = String(item.level ?? "").toLowerCase();
+  if (CRITICAL_MAIL_KINDS.has(kind) || level === "error" || level === "bad") return "critical";
+  if (kind === "chat" || ["user", "assistant", "harness"].includes(String(item.from ?? ""))) return "chat";
+  return "notice";
+}
+
+/** Проставляет tab старым сообщениям и сохраняет файл, если что-то поменялось. */
+function ensureMailTabs() {
+  let changed = false;
+  for (const item of mailbox.items) {
+    const tab = classifyMailTab(item);
+    if (item.tab !== tab) {
+      item.tab = tab;
+      changed = true;
+    }
+  }
+  if (changed) mailbox.save();
+}
+
+/** Добавить сообщение сразу с классификацией. */
+function addMail(fields) {
+  const item = mailbox.add(fields);
+  item.tab = classifyMailTab(item);
+  mailbox.save();
+  return item;
+}
+
+/** Счётчики по вкладкам: всего и непрочитанных. */
+function mailTabSummary() {
+  ensureMailTabs();
+  const tabs = Object.fromEntries(MAIL_TABS.map((t) => [t, { total: 0, unread: 0 }]));
+  for (const item of mailbox.items) {
+    const tab = classifyMailTab(item);
+    tabs[tab].total += 1;
+    if (!item.read) tabs[tab].unread += 1;
+  }
+  return tabs;
+}
+
+function validMailTab(raw) {
+  return MAIL_TABS.includes(raw) ? raw : null;
+}
+
+ensureMailTabs();
+
 
 /* ------------------------- типы чатов и библиотека ------------------------- */
 
@@ -519,7 +583,7 @@ bus.on("event", ({ runId, entry }) => {
   const t = harness.triggers ?? {};
   const project = projects.byRun(runId);
   const name = project?.name ?? runId;
-  const push = (text, kind, level) => mailbox.add({ from: "system", text, kind, level, runId, projectId: project?.id ?? null });
+  const push = (text, kind, level) => addMail({ from: "system", text, kind, level, runId, projectId: project?.id ?? null });
 
   if (entry.kind === "gate" && t.gateAwaiting) push(`«${name}»: ждёт подтверждения — ${String(entry.message).replace(/^Нужно подтверждение: /, "")}`, "gate", "warn");
   if (entry.kind === "error" && t.agentError) push(`«${name}»: ошибка прогона — ${entry.message}`, "error", "bad");
@@ -748,6 +812,10 @@ function snapshot(run) {
     hasMockup: Boolean(run.mockup),
     mockupAt: run.mockup?.at ?? null,
     status: run.status,
+    paused: run.paused === true,
+    pausedAt: run.pausedAt ?? null,
+    pausedStage: run.pausedStage ?? null,
+    pausedStatus: run.pausedStatus ?? null,
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
     stageIndex: run.stageIndex,
@@ -830,7 +898,7 @@ function runWatchCheck() {
     known.add(a.text);
     try {
       added.push(
-        mailbox.add({
+        addMail({
           from: "system",
           text: a.text,
           kind: "watch",
@@ -950,6 +1018,137 @@ function currentStage(run) {
   return stages[run?.stageIndex ?? -1] ?? null;
 }
 
+/* ---------------------------- пауза проекта ---------------------------- */
+
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function projectForRun(run) {
+  return projects.byRun(run.id) ?? (run.projectId ? projects.get(run.projectId) : null);
+}
+
+function clearProjectPause(project) {
+  if (!project) return;
+  project.paused = false;
+  project.pausedAt = null;
+  project.pausedStage = null;
+  project.pausedRunId = null;
+  project.updatedAt = new Date().toISOString();
+}
+
+/**
+ * Мягкая пауза: движок не прерываем посреди вызова модели — даём стадии
+ * доиграть, а сами сразу показываем paused. После завершения активного
+ * прогона фиксируем стадию, на которой остановились.
+ */
+async function settlePause(runId) {
+  const started = Date.now();
+  while (engine.active.has(runId) && Date.now() - started < 5 * 60_000) await delay(150);
+  let run;
+  try {
+    run = store.load(runId);
+  } catch {
+    return;
+  }
+  if (!run?.paused) return;
+  const project = projectForRun(run);
+  if (["done", "failed", "cancelled"].includes(run.status)) {
+    // прогон успел закончиться сам — пауза уже не имеет смысла
+    run.paused = false;
+    run.pausedAt = null;
+    run.pausedStage = null;
+    run.pausedStatus = null;
+    store.save(run);
+    if (project) {
+      clearProjectPause(project);
+      projects.save();
+    }
+    bus.emit("state", { runId, run });
+    return;
+  }
+  if (run.status === "awaiting" && run.awaiting) run.pausedStatus = "awaiting";
+  else if (run.status === "awaiting_plan") run.pausedStatus = "awaiting_plan";
+  const stageId = run.awaiting?.stageId ?? currentStage(run)?.id ?? run.pausedStage ?? null;
+  run.status = "paused";
+  run.paused = true;
+  run.pausedStage = stageId;
+  store.save(run);
+  if (project) {
+    project.paused = true;
+    project.pausedAt = project.pausedAt ?? run.pausedAt ?? new Date().toISOString();
+    project.pausedStage = stageId;
+    project.pausedRunId = run.id;
+    projects.save();
+  }
+  bus.emit("state", { runId, run });
+}
+
+/** Остановить прогон «мягко»: статус paused + отметки в проекте. */
+function pauseRun(run) {
+  const now = new Date().toISOString();
+  const stageId = run.awaiting?.stageId ?? currentStage(run)?.id ?? null;
+  run.paused = true;
+  run.pausedStatus = run.status;
+  run.pausedAt = now;
+  run.pausedStage = stageId;
+  run.status = "paused";
+  store.save(run);
+  const project = projectForRun(run);
+  if (project) {
+    project.paused = true;
+    project.pausedAt = now;
+    project.pausedStage = stageId;
+    project.pausedRunId = run.id;
+    project.updatedAt = now;
+    projects.save();
+  }
+  bus.emit("state", { runId: run.id, run });
+  settlePause(run.id).catch((err) => console.error("[pause]", String(err?.message || err)));
+  return { run, project };
+}
+
+/**
+ * Продолжить с той же стадии. Если пауза застала гейт — возвращаем awaiting
+ * (пользователь сам примет решение), иначе отдаём прогон движку.
+ */
+function resumePausedRun(run) {
+  let was = run.pausedStatus ?? "running";
+  // Движок мог успеть перевести стадию в awaiting/awaiting_plan, пока пауза
+  // фиксировалась: уважаем его актуальный статус, а не только снимок на момент клика.
+  if (run.status === "awaiting" && run.awaiting) was = "awaiting";
+  else if (run.status === "awaiting_plan") was = "awaiting_plan";
+  else if (["done", "failed", "cancelled"].includes(run.status)) was = run.status;
+  const project = projectForRun(run);
+  run.paused = false;
+  run.pausedAt = null;
+  run.pausedStage = null;
+  run.pausedStatus = null;
+  if (project) {
+    clearProjectPause(project);
+    projects.save();
+  }
+  if (was === "done" || was === "failed" || was === "cancelled") {
+    // прогон закончился сам, пока шла пауза — продолжать нечего
+    store.save(run);
+    bus.emit("state", { runId: run.id, run });
+    return { resumed: was };
+  }
+  if (was === "awaiting" && run.awaiting) {
+    run.status = "awaiting";
+    store.save(run);
+    bus.emit("state", { runId: run.id, run });
+    return { resumed: "awaiting" };
+  }
+  if (was === "awaiting_plan") {
+    run.status = "awaiting_plan";
+    store.save(run);
+    bus.emit("state", { runId: run.id, run });
+    return { resumed: "awaiting_plan" };
+  }
+  engine.resume(run).catch((err) => console.error("[engine]", err));
+  return { resumed: "running" };
+}
+
+
 /** Ручные решения по блокам доступны только на стадии «Проверка». */
 function inVerification(run) {
   if (!run) return false;
@@ -998,6 +1197,225 @@ function withRuns(project) {
   runs.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
   return { ...project, runs };
 }
+
+/* ------------------------- снимки состояния портала ------------------------- */
+
+const SNAPSHOT_ID_RE = /^[\w.-]+$/;
+
+function snapshotSlug(raw) {
+  const map = {
+    а: "a", б: "b", в: "v", г: "g", д: "d", е: "e", ё: "e", ж: "zh", з: "z", и: "i", й: "y",
+    к: "k", л: "l", м: "m", н: "n", о: "o", п: "p", р: "r", с: "s", т: "t", у: "u", ф: "f",
+    х: "h", ц: "c", ч: "ch", ш: "sh", щ: "sch", ъ: "", ы: "y", ь: "", э: "e", ю: "yu", я: "ya",
+  };
+  const text = String(raw ?? "").trim().toLowerCase();
+  let out = "";
+  for (const ch of text) out += map[ch] ?? ch;
+  out = out.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
+  return out || "manual";
+}
+
+function snapshotStamp(date = new Date()) {
+  const p = (n) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}${p(date.getMonth() + 1)}${p(date.getDate())}-${p(date.getHours())}${p(date.getMinutes())}${p(date.getSeconds())}`;
+}
+
+/** Файлы, которые входят в снимок: относительный путь в снимке → реальный путь. */
+function snapshotSources() {
+  const out = [{ rel: "projects.json", abs: projects.file }];
+  for (const name of ["agents.json", "pipeline.json", "harness.json"]) {
+    out.push({ rel: `config/${name}`, abs: path.join(CONFIG_DIR, name) });
+  }
+  out.push({ rel: "studio/sessions.json", abs: studio.sessionsFile });
+  out.push({ rel: "studio/library.json", abs: library.file });
+  if (fs.existsSync(store.runsDir)) {
+    for (const id of fs.readdirSync(store.runsDir)) {
+      if (!SNAPSHOT_ID_RE.test(id)) continue;
+      const rel = `runs/${id}/state.json`;
+      const abs = path.join(store.runDir(id), "state.json");
+      if (fs.existsSync(abs)) out.push({ rel, abs });
+    }
+  }
+  return out;
+}
+
+/** Обратное отображение: путь в снимке → путь, который можно перезаписать при restore. */
+function snapshotTarget(rel) {
+  const norm = String(rel ?? "").replace(/\\/g, "/");
+  if (norm === "projects.json") return projects.file;
+  if (/^config\/[A-Za-z0-9._-]+\.json$/.test(norm)) return path.join(CONFIG_DIR, path.basename(norm));
+  if (norm === "studio/sessions.json") return studio.sessionsFile;
+  if (norm === "studio/library.json") return library.file;
+  const runMatch = norm.match(/^runs\/([\w.-]+)\/state\.json$/);
+  if (runMatch) return path.join(store.runDir(runMatch[1]), "state.json");
+  return null;
+}
+
+function dirSize(dir) {
+  let total = 0;
+  if (!fs.existsSync(dir)) return 0;
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) total += dirSize(full);
+    else {
+      try {
+        total += fs.statSync(full).size;
+      } catch {
+        /* файл исчез — не считаем */
+      }
+    }
+  }
+  return total;
+}
+
+function snapshotInfo(id) {
+  const dir = path.join(SNAPSHOTS_DIR, id);
+  let manifest = null;
+  try {
+    manifest = readJson(path.join(dir, "manifest.json"));
+  } catch {
+    manifest = null;
+  }
+  const stat = fs.statSync(dir);
+  const runs = manifest?.runs ?? (fs.existsSync(path.join(dir, "runs")) ? fs.readdirSync(path.join(dir, "runs")).length : 0);
+  return {
+    id,
+    name: manifest?.name ?? id,
+    createdAt: manifest?.createdAt ?? stat.mtime.toISOString(),
+    size: manifest?.size ?? dirSize(dir),
+    runs,
+    files: manifest?.files?.length ?? null,
+  };
+}
+
+function listSnapshots() {
+  if (!fs.existsSync(SNAPSHOTS_DIR)) return [];
+  const out = [];
+  for (const entry of fs.readdirSync(SNAPSHOTS_DIR, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !SNAPSHOT_ID_RE.test(entry.name)) continue;
+    if (!fs.existsSync(path.join(SNAPSHOTS_DIR, entry.name, "manifest.json"))) continue;
+    try {
+      out.push(snapshotInfo(entry.name));
+    } catch {
+      /* битый снимок — пропускаем */
+    }
+  }
+  return out.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+}
+
+/** Создать снимок: копирует файлы, повторяя структуру исходного портала. */
+function createSnapshot(rawName) {
+  const name = String(rawName ?? "").trim().slice(0, 120) || "снимок";
+  fs.mkdirSync(SNAPSHOTS_DIR, { recursive: true });
+  const base = `${snapshotStamp()}-${snapshotSlug(name)}`;
+  let id = base;
+  for (let n = 2; fs.existsSync(path.join(SNAPSHOTS_DIR, id)); n++) id = `${base}-${n}`;
+  const dir = path.join(SNAPSHOTS_DIR, id);
+  fs.mkdirSync(dir, { recursive: true });
+  const files = [];
+  let runs = 0;
+  for (const src of snapshotSources()) {
+    if (!fs.existsSync(src.abs) || fs.statSync(src.abs).isDirectory()) continue;
+    const target = path.join(dir, src.rel);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.copyFileSync(src.abs, target);
+    const size = fs.statSync(target).size;
+    files.push({ rel: src.rel, size });
+    if (src.rel.startsWith("runs/")) runs++;
+  }
+  const manifest = {
+    version: 1,
+    id,
+    name,
+    createdAt: new Date().toISOString(),
+    runs,
+    size: dirSize(dir),
+    files,
+  };
+  fs.writeFileSync(path.join(dir, "manifest.json"), JSON.stringify(manifest, null, 2), "utf8");
+  return manifest;
+}
+
+function snapshotDir(id) {
+  const value = String(id ?? "");
+  if (!SNAPSHOT_ID_RE.test(value)) throw new Error("Некорректный id снимка");
+  const dir = path.resolve(SNAPSHOTS_DIR, value);
+  const root = path.resolve(SNAPSHOTS_DIR);
+  if (dir !== path.join(root, value) || !dir.startsWith(root + path.sep)) throw new Error("Снимок вне каталога снимков");
+  if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) throw new Error(`Снимок ${value} не найден`);
+  return dir;
+}
+
+/** Перечитать то, что могло измениться на диске после restore. */
+function reloadAfterRestore() {
+  try {
+    config = readConfig();
+    engine.config = config;
+  } catch (err) {
+    console.error("[snapshot] config не перечитался:", String(err?.message || err));
+  }
+  try {
+    harness = readJson(path.join(CONFIG_DIR, "harness.json"));
+  } catch {
+    /* оставим прежний */
+  }
+  try {
+    const raw = readJson(projects.file);
+    projects.items = Array.isArray(raw.projects) ? raw.projects : [];
+  } catch {
+    projects.items = [];
+  }
+  store.cache.clear();
+  try {
+    if (fs.existsSync(studio.sessionsFile)) {
+      const raw = readJson(studio.sessionsFile);
+      studio.sessions = Array.isArray(raw.sessions) ? raw.sessions : [];
+      studio.activeId = raw.activeId ?? studio.sessions[0]?.id ?? null;
+    }
+  } catch {
+    /* студия останется как была */
+  }
+  try {
+    library.load();
+  } catch {
+    /* пометки библиотеки не критичны */
+  }
+}
+
+/** Восстановить файлы снимка; сначала обязательно снимок текущего состояния. */
+function restoreSnapshot(id) {
+  const dir = snapshotDir(id);
+  const manifest = readJson(path.join(dir, "manifest.json"));
+  const entries = Array.isArray(manifest.files) ? manifest.files : [];
+  if (!entries.length) throw new Error("В снимке нет файлов");
+  const before = createSnapshot("before-restore");
+  let restored = 0;
+  const skipped = [];
+  for (const entry of entries) {
+    const target = snapshotTarget(entry.rel);
+    if (!target) {
+      skipped.push(entry.rel);
+      continue;
+    }
+    const source = path.join(dir, entry.rel);
+    if (!fs.existsSync(source)) {
+      skipped.push(entry.rel);
+      continue;
+    }
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.copyFileSync(source, target);
+    restored++;
+  }
+  reloadAfterRestore();
+  return { snapshot: snapshotInfo(id), before, restored, skipped };
+}
+
+function deleteSnapshot(id) {
+  const dir = snapshotDir(id);
+  fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+  return { ok: true, id };
+}
+
 
 function serveFile(res, file, cacheSeconds = 0) {
   if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) return json(res, 404, { error: "not found" });
@@ -1287,13 +1705,22 @@ const server = http.createServer(async (req, res) => {
 
       let projectId = body.projectId ? String(body.projectId) : base?.projectId ?? null;
       if (projectId && !projects.get(projectId)) projectId = null;
+      if (projectId) {
+        const proj = projects.get(projectId);
+        if (proj?.paused) {
+          return json(res, 409, {
+            error: `Проект «${proj.name}» на паузе — сначала продолжите прогон${proj.pausedStage ? ` (стадия «${proj.pausedStage}»)` : ""}`,
+            project: withRuns(proj),
+          });
+        }
+      }
       if (!projectId) projectId = projects.create({ name: task.slice(0, 80), task }).id;
 
       const run = store.create(task, { base, change, projectId });
       projects.attach(projectId, run.id);
       if (harness.triggers?.projectStart) {
         const proj = projects.get(projectId);
-        mailbox.add({
+        addMail({
           from: "system",
           text: change
             ? `«${proj?.name ?? projectId}»: доработка — ${change}`
@@ -1321,7 +1748,7 @@ const server = http.createServer(async (req, res) => {
       if (!project) return json(res, 404, { error: "Проект не найден" });
       const active = project.runIds.filter((id) => {
         try {
-          return ["running", "awaiting", "awaiting_plan"].includes(store.load(id).status);
+          return ["running", "awaiting", "awaiting_plan", "paused"].includes(store.load(id).status);
         } catch {
           return false;
         }
@@ -1368,6 +1795,87 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, deletedRuns: project.runIds.length - leftover.length, leftover });
     }
 
+    /* ------------------------------ снимки ------------------------------ */
+
+    if (pathname === "/api/snapshots" && method === "GET") {
+      return json(res, 200, { snapshots: listSnapshots(), dir: SNAPSHOTS_DIR });
+    }
+
+    if (pathname === "/api/snapshots" && method === "POST") {
+      const body = await readBody(req).catch(() => ({}));
+      try {
+        const manifest = createSnapshot(body.name);
+        return json(res, 201, { snapshot: snapshotInfo(manifest.id), snapshots: listSnapshots() });
+      } catch (err) {
+        return json(res, 500, { error: `Снимок не создался: ${String(err?.message || err)}` });
+      }
+    }
+
+    const snm = pathname.match(/^\/api\/snapshots\/([\w.-]+)(?:\/(restore))?$/);
+    if (snm) {
+      const [, snapshotId, action] = snm;
+      if (action === "restore" && method === "POST") {
+        if (user.role !== "admin") return json(res, 403, { error: "восстанавливать снимки может только администратор" });
+        try {
+          const result = restoreSnapshot(snapshotId);
+          return json(res, 200, { ok: true, ...result, snapshots: listSnapshots() });
+        } catch (err) {
+          return json(res, 400, { error: `Не удалось восстановить: ${String(err?.message || err)}` });
+        }
+      }
+      if (!action && method === "DELETE") {
+        try {
+          deleteSnapshot(snapshotId);
+          return json(res, 200, { ok: true, id: snapshotId, snapshots: listSnapshots() });
+        } catch (err) {
+          return json(res, 404, { error: String(err?.message || err) });
+        }
+      }
+      if (!action && method === "GET") {
+        try {
+          snapshotDir(snapshotId);
+          return json(res, 200, { snapshot: snapshotInfo(snapshotId) });
+        } catch (err) {
+          return json(res, 404, { error: String(err?.message || err) });
+        }
+      }
+    }
+
+    /*
+     * «Очистить несуществующие»: у проекта нет ни одного живого прогона на
+     * диске (state.json) и нет своего каталога projects/<id> (если такой
+     * каталог вообще используется). Проекты с живыми прогонами не трогаем.
+     */
+    if (pathname === "/api/projects/cleanup" && req.method === "POST") {
+      const projectsRoot = path.join(ROOT, "projects");
+      const hasProjectDirs = fs.existsSync(projectsRoot) && fs.statSync(projectsRoot).isDirectory();
+      const liveIdsFor = (project) =>
+        (project.runIds ?? []).filter((id) => /^[\w.-]+$/.test(String(id)) && fs.existsSync(path.join(store.runDir(id), "state.json")));
+      const removed = [];
+      const kept = [];
+      for (const project of projects.list()) {
+        const live = liveIdsFor(project);
+        const hasDir = hasProjectDirs && fs.existsSync(path.join(projectsRoot, project.id));
+        if (live.length || hasDir) {
+          kept.push({ id: project.id, name: project.name, liveRuns: live.length });
+          continue;
+        }
+        removed.push({ id: project.id, name: project.name, runs: project.runIds?.length ?? 0 });
+      }
+      if (removed.length) {
+        const gone = new Set(removed.map((p) => p.id));
+        projects.items = projects.items.filter((p) => !gone.has(p.id));
+        projects.save();
+      }
+      return json(res, 200, {
+        ok: true,
+        removed: removed.length,
+        kept: kept.length,
+        projects: removed,
+        projectDirs: hasProjectDirs ? "checked" : "runs-only",
+      });
+    }
+
     if (pathname === "/api/maintenance/cleanup" && req.method === "POST") {
       const known = new Set(projects.list().flatMap((p) => p.runIds));
       const removed = [];
@@ -1411,15 +1919,16 @@ const server = http.createServer(async (req, res) => {
           } catch {
             continue;
           }
-          if (!["running", "awaiting", "awaiting_plan", "interrupted"].includes(r.status)) continue;
+          if (!["running", "awaiting", "awaiting_plan", "interrupted", "paused"].includes(r.status)) continue;
           const stage = config.pipeline.stages[r.stageIndex];
+          const pausedStage = r.pausedStage ? config.pipeline.stages.find((s) => s.id === r.pausedStage) : null;
           tasks.push({
             runId: r.id,
             projectId: p.id,
             project: p.name,
             status: r.status,
-            stage: stage?.title ?? "—",
-            awaiting: r.awaiting?.title ?? null,
+            stage: (r.status === "paused" ? pausedStage?.title : stage?.title) ?? "—",
+            awaiting: r.status === "paused" ? "на паузе" : r.awaiting?.title ?? null,
             change: r.change,
             updatedAt: r.updatedAt,
           });
@@ -1516,7 +2025,11 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (pathname === "/api/alerts" && req.method === "GET") {
-      return json(res, 200, { alerts: collectPortalAlerts() });
+      const alerts = collectPortalAlerts().map((a) => ({
+        ...a,
+        tab: a.level === "bad" || a.level === "error" ? "critical" : "notice",
+      }));
+      return json(res, 200, { alerts });
     }
 
     /* ------------------------------ дежурный ------------------------------ */
@@ -1546,23 +2059,56 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (pathname === "/api/mailbox" && req.method === "GET") {
-      return json(res, 200, { items: mailbox.list(100), unread: mailbox.unread() });
+      ensureMailTabs();
+      const tab = validMailTab(url.searchParams.get("tab"));
+      const limitRaw = Number(url.searchParams.get("limit") ?? 100);
+      const limit = Number.isFinite(limitRaw) ? Math.min(400, Math.max(1, Math.floor(limitRaw))) : 100;
+      const source = tab ? mailbox.items.filter((i) => classifyMailTab(i) === tab) : mailbox.items;
+      return json(res, 200, {
+        items: source.slice(-limit),
+        unread: mailbox.unread(),
+        tabs: mailTabSummary(),
+        filter: tab,
+      });
     }
 
     if (pathname === "/api/mailbox" && req.method === "POST") {
       const body = await readBody(req);
       const text = String(body.text ?? "").trim();
       if (!text) return json(res, 400, { error: "Пустое сообщение" });
-      const from = body.from === "harness" ? "harness" : body.from === "system" ? "system" : "user";
-      const item = mailbox.add({ from, text, kind: "chat" });
-      return json(res, 200, { item, unread: mailbox.unread() });
+      const from = body.from === "harness" ? "harness" : body.from === "system" ? "system" : body.from === "assistant" ? "assistant" : "user";
+      const item = addMail({ from, text, kind: "chat" });
+      return json(res, 200, { item, unread: mailbox.unread(), tabs: mailTabSummary() });
     }
 
     if (pathname === "/api/mailbox/read" && req.method === "POST") {
       const body = await readBody(req);
-      mailbox.markRead(Array.isArray(body.ids) ? body.ids : []);
-      return json(res, 200, { ok: true, unread: mailbox.unread() });
+      ensureMailTabs();
+      const tab = validMailTab(body.tab);
+      if (body.all === true) {
+        mailbox.markRead([], true);
+      } else if (tab) {
+        // «прочитать всё» на вкладке: только сообщения этой вкладки
+        const ids = mailbox.items.filter((i) => classifyMailTab(i) === tab && !i.read).map((i) => i.id);
+        mailbox.markRead(ids);
+      } else {
+        mailbox.markRead(Array.isArray(body.ids) ? body.ids : []);
+      }
+      return json(res, 200, { ok: true, unread: mailbox.unread(), tabs: mailTabSummary() });
     }
+
+    if (pathname === "/api/mailbox/clear" && req.method === "POST") {
+      const body = await readBody(req).catch(() => ({}));
+      ensureMailTabs();
+      const tab = validMailTab(body.tab);
+      if (!tab) return json(res, 400, { error: "Неизвестная вкладка: нужна critical, notice или chat" });
+      const before = mailbox.items.length;
+      mailbox.items = mailbox.items.filter((i) => classifyMailTab(i) !== tab);
+      const removed = before - mailbox.items.length;
+      mailbox.save();
+      return json(res, 200, { ok: true, tab, removed, unread: mailbox.unread(), tabs: mailTabSummary() });
+    }
+
 
     if (pathname === "/api/harness" && req.method === "GET") {
       return json(res, 200, { harness });
@@ -2456,7 +3002,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { run: snapshot(run), completed: false });
     }
 
-    const m = pathname.match(/^\/api\/runs\/([\w.-]+)(?:\/(events|approve|cancel|resume|artifact|plan|diff|export\.zip))?$/);
+    const m = pathname.match(/^\/api\/runs\/([\w.-]+)(?:\/(events|approve|cancel|resume|pause|artifact|plan|diff|export\.zip))?$/);
     if (m) {
       const [, id, action] = m;
       const run = store.load(id);
@@ -2535,13 +3081,40 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { run: snapshot(updated) });
       }
 
+      if (action === "pause" && req.method === "POST") {
+        if (run.status === "paused") return json(res, 200, { run: snapshot(run), project: projectForRun(run) ? withRuns(projectForRun(run)) : null });
+        if (!["running", "awaiting", "awaiting_plan"].includes(run.status)) {
+          return json(res, 409, { error: `Нельзя поставить на паузу прогон в статусе «${run.status}»` });
+        }
+        const { project } = pauseRun(run);
+        return json(res, 200, { run: snapshot(run), project: project ? withRuns(project) : null });
+      }
+
       if (action === "cancel" && req.method === "POST") {
+        // отмена снимает и паузу проекта: иначе проект останется заперт
+        const project = projectForRun(run);
+        if (run.paused && project) {
+          clearProjectPause(project);
+          projects.save();
+        }
+        run.paused = false;
+        run.pausedAt = null;
+        run.pausedStage = null;
+        run.pausedStatus = null;
         engine.cancel(run);
         bus.emit("state", { runId: id, run });
         return json(res, 200, { run: snapshot(run) });
       }
 
       if (action === "resume" && req.method === "POST") {
+        if (run.paused || run.status === "paused") {
+          const { resumed } = resumePausedRun(run);
+          const project = projectForRun(run);
+          const payload = { run: snapshot(run), resumed, project: project ? withRuns(project) : null };
+          if (resumed === "awaiting" || resumed === "awaiting_plan") return json(res, 200, payload);
+          if (resumed === "done" || resumed === "failed" || resumed === "cancelled") return json(res, 200, payload);
+          return json(res, 202, payload);
+        }
         json(res, 202, { run: snapshot(run) });
         engine.resume(run).catch((err) => console.error("[engine]", err));
         return;

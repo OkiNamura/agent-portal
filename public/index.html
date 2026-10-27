@@ -70,6 +70,7 @@
         <button data-tab="diff">Изменения</button>
         <span class="spacer"></span>
         <a id="downloadZip" class="mini link hidden" href="#" title="Скачать файлы проекта и отчёты одним архивом">Скачать ZIP</a>
+        <button id="runPause" class="mini hidden" data-write title="Мягко остановить прогон; продолжить можно с той же стадии">⏸ Пауза</button>
         <button id="stopRun" class="mini danger hidden" data-write>■ Остановить</button>
         <span id="runStatus" class="runStatus"></span>
       </nav>
@@ -300,7 +301,18 @@
     <span class="spacer"></span>
     <button id="cornerClose" class="mini">✕</button>
   </div>
-  <div id="cornerAlerts" class="cornerAlerts"></div>
+  <div id="cornerTabs" class="cornerTabs">
+    <button type="button" data-ctab="critical" class="active">Критичное <span class="ctabCount" data-ctab-count="critical">0</span></button>
+    <button type="button" data-ctab="notice">Оповещения <span class="ctabCount" data-ctab-count="notice">0</span></button>
+    <button type="button" data-ctab="chat">Чат <span class="ctabCount" data-ctab-count="chat">0</span></button>
+  </div>
+  <div class="cornerTools">
+    <span id="cornerTabInfo" class="dim"></span>
+    <span class="spacer"></span>
+    <button id="cornerReadAll" class="mini" data-write>прочитать всё</button>
+    <button id="cornerClear" class="mini danger" data-write>очистить</button>
+  </div>
+  <div id="cornerAlerts" class="cornerAlerts hidden"></div>
   <div id="cornerLog" class="cornerLog"></div>
   <div class="cornerInput">
     <input id="cornerInput" placeholder="Написать Харнессу…" />

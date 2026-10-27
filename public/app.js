@@ -36,7 +36,7 @@ const S = {
   studio: { thread: [], models: [], sessions: [], activeId: null, refItem: null, refData: null, lastText: "", view: "all", collapsed: {} },
   gallery: { items: [], total: 0, cost: 0, q: "", view: "all" },
   watch: { running: false, everyMin: 10, lastRunAt: null, lastAlerts: [] },
-  corner: { items: [], unread: 0, alerts: [] },
+  corner: { items: [], unread: 0, alerts: [], tabs: {}, tab: "critical" },
   globalStream: null,
   diff: { runId: null, data: null, file: null },
   tab: "flow",
@@ -357,7 +357,7 @@ async function submitLogout() {
 
 const hhmmss = (iso) => (iso ? new Date(iso) : new Date()).toTimeString().slice(0, 8);
 const statusLabel = (s) =>
-  ({ running: "идёт", awaiting: "ждёт", awaiting_plan: "нужен план", done: "готов", failed: "ошибка", cancelled: "стоп", interrupted: "прерван" }[s] || s);
+  ({ running: "идёт", awaiting: "ждёт", awaiting_plan: "нужен план", paused: "на паузе", done: "готов", failed: "ошибка", cancelled: "стоп", interrupted: "прерван" }[s] || s);
 
 /* ------------------------------- boot ------------------------------- */
 
@@ -436,10 +436,14 @@ function renderList() {
     const broom = el("button", "mini", "🧹");
     broom.title = "Убрать с диска прогоны, не привязанные к проектам";
     broom.addEventListener("click", cleanupDisk);
+    const broken = el("button", "mini", "битые");
+    broken.title = "Очистить несуществующие проекты: без живых прогонов на диске";
+    broken.dataset.write = "";
+    broken.addEventListener("click", cleanMissingProjects);
     const add = el("button", "mini", "+");
     add.title = "Новый проект";
     add.addEventListener("click", newProjectMode);
-    head.append(broom, add);
+    head.append(broom, broken, add);
     box.append(head);
 
     if (!S.projects.length) box.append(el("div", "empty", "пока нет проектов"));
@@ -449,6 +453,7 @@ function renderList() {
       const txt = el("div", "txt");
       const n = el("div", "n");
       n.append(dot(last?.status), el("span", null, p.name));
+      if (p.paused) n.append(el("span", "tag pausedTag", "пауза"));
       txt.append(n, el("div", "m", `${p.runs?.length ?? 0} верс. · ${statusLabel(last?.status ?? "—")}`));
       const kill = el("button", "kill projectKill", "✕");
       kill.title = "Удалить проект";
@@ -548,7 +553,7 @@ function renderList() {
     const head = el("div", "listHead");
     head.append(el("span", null, "Разделы"));
     box.append(head);
-    for (const [label, anchor] of [["Расход", "statsCost"], ["Модели", "statsModels"], ["Проекты", "statsProjects"], ["Агенты", "statsAgents"], ["Дни", "statsDays"]]) {
+    for (const [label, anchor] of [["Расход", "statsCost"], ["Снимки", "statsSnapshots"], ["Модели", "statsModels"], ["Проекты", "statsProjects"], ["Агенты", "statsAgents"], ["Дни", "statsDays"]]) {
       const item = el("div", "item");
       const txt = el("div", "txt");
       txt.append(el("div", "n", label), el("div", "m", "перейти"));
@@ -1947,6 +1952,31 @@ async function cleanupDisk() {
   }
 }
 
+async function cleanMissingProjects() {
+  if (
+    !confirm(
+      "Очистить несуществующие проекты? Из projects.json удалятся записи, у которых нет ни одного живого прогона на диске. Проекты с живыми прогонами останутся."
+    )
+  ) {
+    return;
+  }
+  try {
+    const res = await api("/api/projects/cleanup", { method: "POST", body: JSON.stringify({}) });
+    const names = (res.projects ?? []).map((p) => `«${p.name}»`).join(", ");
+    alert(res.removed ? `Удалено проектов: ${res.removed}${names ? " — " + names : ""}` : "Несуществующих проектов нет — все записи живые.");
+    const st = await api("/api/state");
+    S.projects = st.projects ?? [];
+    if (S.project && !S.projects.some((p) => p.id === S.project.id)) newProjectMode();
+    else {
+      renderList();
+      renderProjectHead();
+    }
+    pollTasks();
+  } catch (err) {
+    alert(err.message);
+  }
+}
+
 const chat = [];
 
 function renderChat() {
@@ -1992,7 +2022,7 @@ async function ask() {
 
 function dot(status) {
   const d = el("span", "dot");
-  const map = { done: "var(--ok)", failed: "var(--bad)", cancelled: "var(--bad)", interrupted: "var(--bad)", awaiting: "var(--warn)", awaiting_plan: "var(--warn)", running: "var(--accent)" };
+  const map = { done: "var(--ok)", failed: "var(--bad)", cancelled: "var(--bad)", interrupted: "var(--bad)", awaiting: "var(--warn)", awaiting_plan: "var(--warn)", paused: "var(--warn)", running: "var(--accent)" };
   if (map[status]) d.style.background = map[status];
   return d;
 }
@@ -2057,6 +2087,31 @@ function renderProjectHead() {
   const facts = el("div", "facts");
   const cost = S.runs.reduce((a, r) => a + (r.cost || 0), 0);
   facts.append(el("span", null, `версий: ${S.runs.length}`), el("span", null, `$${cost.toFixed(4)}`));
+  if (S.project.paused) {
+    const badge = el("span", "badge pausedBadge", "⏸ на паузе");
+    badge.title = S.project.pausedStage ? `остановлен на стадии «${S.project.pausedStage}»` : "прогон остановлен";
+    facts.append(badge);
+    if (S.project.pausedAt) facts.append(el("span", null, `с ${hhmmss(S.project.pausedAt)}`));
+    const go = el("button", "mini", "▶ Продолжить");
+    go.dataset.write = "";
+    go.title = "Продолжить с той же стадии";
+    go.addEventListener("click", () => resumeRun(S.project.pausedRunId || S.current?.id));
+    facts.append(go);
+  } else {
+    const active = S.runs.find((r) => ["running", "awaiting", "awaiting_plan"].includes(r.status));
+    if (active) {
+      const pause = el("button", "mini", "⏸ Пауза");
+      pause.dataset.write = "";
+      pause.title = "Мягко остановить прогон: текущий вызов доиграет, новые стадии не пойдут";
+      pause.addEventListener("click", () => pauseProjectRun(active.id));
+      facts.append(pause);
+    }
+  }
+  const clean = el("button", "mini", "очистить несуществующие");
+  clean.dataset.write = "";
+  clean.title = "Удалить из projects.json записи без живых прогонов на диске; проекты с живыми прогонами останутся";
+  clean.addEventListener("click", cleanMissingProjects);
+  facts.append(clean);
   const del = el("button", "mini danger projectKill", "удалить проект");
   del.addEventListener("click", () => deleteProject(S.project));
   facts.append(del);
@@ -2311,6 +2366,102 @@ async function renderWatchCard(box) {
   box.append(card);
 }
 
+/* --------------------------- снимки состояния --------------------------- */
+
+const fmtBytes = (bytes) => {
+  const n = Number(bytes ?? 0);
+  if (!Number.isFinite(n) || n <= 0) return "0 Б";
+  if (n < 1024) return `${n} Б`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} КБ`;
+  return `${(n / (1024 * 1024)).toFixed(2)} МБ`;
+};
+const fmtDate = (iso) => (iso ? new Date(iso).toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }) : "—");
+
+async function saveSnapshot() {
+  const name = prompt("Название снимка (необязательно):", "");
+  if (name === null) return;
+  try {
+    const res = await api("/api/snapshots", { method: "POST", body: JSON.stringify({ name }) });
+    alert(`Снимок создан: «${res.snapshot?.name ?? "снимок"}» · ${fmtBytes(res.snapshot?.size)} · прогонов: ${res.snapshot?.runs ?? 0}`);
+    await loadStats();
+  } catch (err) {
+    alert(err.message);
+  }
+}
+
+async function restoreSnapshot(id, name) {
+  if (!confirm(`Восстановить состояние из снимка «${name}»? Сначала автоматически сохраним текущее состояние (before-restore).`)) return;
+  try {
+    const res = await api(`/api/snapshots/${encodeURIComponent(id)}/restore`, { method: "POST", body: JSON.stringify({}) });
+    alert(
+      `Восстановлено файлов: ${res.restored}. Авто-снимок текущего состояния: «${res.before?.name ?? "before-restore"}». Страница перезагрузится.`
+    );
+    window.location.reload();
+  } catch (err) {
+    alert(err.message);
+  }
+}
+
+async function deleteSnapshot(id, name) {
+  if (!confirm(`Удалить снимок «${name}»? Файлы снимка пропадут безвозвратно.`)) return;
+  try {
+    await api(`/api/snapshots/${encodeURIComponent(id)}`, { method: "DELETE" });
+    await loadStats();
+  } catch (err) {
+    alert(err.message);
+  }
+}
+
+async function renderSnapshots(box) {
+  let snapshots = [];
+  let error = null;
+  try {
+    ({ snapshots } = await api("/api/snapshots"));
+  } catch (err) {
+    error = err.message;
+  }
+  const card = el("div", "card snapshotCard");
+  card.id = "statsSnapshots";
+  const head = el("div", "listHead");
+  head.append(el("span", null, "Состояние портала"));
+  const save = el("button", "mini", "Сохранить состояние");
+  save.dataset.write = "";
+  save.title = "Сохранить projects.json, config/, studio/ и state.json всех прогонов";
+  save.addEventListener("click", saveSnapshot);
+  head.append(save);
+  card.append(head);
+  card.append(el("div", "hint", "Снимок — это папка snapshots/<дата>-<имя>: проекты, настройки агентов и пайплайна, студия и состояния прогонов. Перед восстановлением всегда делается авто-снимок before-restore."));
+  if (error) card.append(el("div", "empty", "Снимки не прочитались: " + error));
+  else if (!snapshots.length) card.append(el("div", "empty", "снимков пока нет — сохрани состояние перед рискованным изменением"));
+  else {
+    const t = el("table", "tbl");
+    t.innerHTML = "<thead><tr><th>Имя</th><th>Когда</th><th>Размер</th><th>Прогонов</th><th></th></tr></thead>";
+    const tb = document.createElement("tbody");
+    for (const snap of snapshots) {
+      const tr = document.createElement("tr");
+      tr.append(td(snap.name, "name"), td(fmtDate(snap.createdAt)), td(fmtBytes(snap.size)), td(String(snap.runs ?? 0)));
+      const acts = document.createElement("td");
+      acts.className = "snapActs";
+      if (S.role === "admin") {
+        const restore = el("button", "mini", "восстановить");
+        restore.title = "Вернуть файлы к состоянию снимка";
+        restore.addEventListener("click", () => restoreSnapshot(snap.id, snap.name));
+        acts.append(restore);
+      }
+      const del = el("button", "mini danger", "удалить");
+      del.dataset.write = "";
+      del.title = "Удалить снимок";
+      del.addEventListener("click", () => deleteSnapshot(snap.id, snap.name));
+      acts.append(del);
+      tr.append(acts);
+      tb.append(tr);
+    }
+    t.append(tb);
+    card.append(t);
+  }
+  box.append(card);
+}
+
 async function loadStats() {
   const box = $("#statsBody");
   box.textContent = "…";
@@ -2333,6 +2484,7 @@ async function loadStats() {
     cards.id = "statsCost";
     box.append(cards);
 
+    await renderSnapshots(box);
     await renderWatchCard(box);
     await renderAgentMetrics(box);
 
@@ -2503,6 +2655,7 @@ function clearRun() {
   $("#runStatus").textContent = "";
   $("#artifacts").textContent = "";
   $("#downloadZip")?.classList.add("hidden");
+  $("#runPause")?.classList.add("hidden");
   $("#preview").src = "about:blank";
   renderStages();
 }
@@ -2554,10 +2707,6 @@ function connectGlobalStream() {
         const status = $("#cornerStatus");
         if (status) status.textContent = `дежурный: ${hhmmss(data.lastRunAt)}`;
       }
-      if (data.alerts?.length) {
-        const badge = $("#cornerBadge");
-        if (badge) badge.classList.remove("hidden");
-      }
       pollCorner();
     } catch {
       /* битое событие не должно ломать страницу */
@@ -2579,6 +2728,16 @@ function applyRun(run) {
   S.current = run;
   $("#runStatus").textContent = `${statusLabel(run.status)} · ${run.usage.calls} вызовов · $${(run.usage.cost || 0).toFixed(4)}`;
   $("#stopRun").classList.toggle("hidden", !["running", "awaiting", "awaiting_plan"].includes(run.status));
+  const pauseBtn = $("#runPause");
+  if (pauseBtn) {
+    const canPause = ["running", "awaiting", "awaiting_plan", "paused"].includes(run.status);
+    pauseBtn.classList.toggle("hidden", !canPause);
+    pauseBtn.textContent = run.status === "paused" ? "▶ Продолжить" : "⏸ Пауза";
+    pauseBtn.title =
+      run.status === "paused"
+        ? "Продолжить прогон с той же стадии"
+        : "Мягко остановить: текущий вызов модели доиграет, новые стадии не пойдут";
+  }
   const zip = $("#downloadZip");
   if (zip) {
     zip.href = `/api/runs/${encodeURIComponent(run.id)}/export.zip`;
@@ -2730,6 +2889,18 @@ function renderGate(run) {
     return;
   }
 
+  if (run.status === "paused") {
+    box.classList.remove("hidden");
+    const head = el("div", "q");
+    head.append(el("b", null, "Проект на паузе"), el("span", null, " — прогон остановлен мягко, текущий вызов модели мог доиграть."));
+    const acts = el("div", "acts");
+    const again = el("button", "okBtn", "Продолжить с той же стадии");
+    again.addEventListener("click", () => resumeRun(run.id));
+    acts.append(again);
+    box.append(head, acts);
+    return;
+  }
+
   if (["interrupted", "failed"].includes(run.status)) {
     box.classList.remove("hidden");
     const head = el("div", "q");
@@ -2823,9 +2994,13 @@ function gatePreview(run) {
 function renderIterate(run) {
   const box = $("#iterate");
   const hasCode = (run.artifacts || []).some((a) => a.path.startsWith("work/"));
-  const can = hasCode && S.project && !["running", "interrupted"].includes(run.status);
+  const can = hasCode && S.project && !["running", "interrupted", "paused"].includes(run.status);
   box.classList.toggle("hidden", !can);
-  if (can) $("#changeInput").placeholder = `Что изменить в «${(run.plan?.title || S.project.name).slice(0, 40)}»?`;
+  if (can) {
+    $("#changeInput").placeholder = `Что изменить в «${(run.plan?.title || S.project.name).slice(0, 40)}»?`;
+    $("#iterateBtn").disabled = Boolean(S.project?.paused);
+    if (S.project?.paused) $("#changeInput").placeholder = "Проект на паузе — сначала продолжите прогон";
+  }
 }
 
 async function decide(decision) {
@@ -2842,10 +3017,40 @@ async function decide(decision) {
   }
 }
 
-async function resumeRun() {
+function applyProjectPauseState(project) {
+  if (!project || !S.project || project.id !== S.project.id) return;
+  Object.assign(S.project, {
+    paused: project.paused === true,
+    pausedAt: project.pausedAt ?? null,
+    pausedStage: project.pausedStage ?? null,
+    pausedRunId: project.pausedRunId ?? null,
+  });
+  S.projects = S.projects.map((p) =>
+    p.id === project.id ? { ...p, paused: project.paused === true, pausedAt: project.pausedAt ?? null, pausedStage: project.pausedStage ?? null } : p
+  );
+  renderProjectHead();
+  renderList();
+}
+
+async function pauseProjectRun(id = S.current?.id) {
+  if (!id) return;
   try {
-    const { run } = await api(`/api/runs/${S.current.id}/resume`, { method: "POST" });
+    const res = await api(`/api/runs/${id}/pause`, { method: "POST" });
+    applyProjectPauseState(res.project);
+    if (res.run) applyRun(res.run);
+    pollTasks();
+  } catch (err) {
+    alert(err.message);
+  }
+}
+
+async function resumeRun(id = S.current?.id) {
+  if (!id) return;
+  try {
+    const { run, project } = await api(`/api/runs/${id}/resume`, { method: "POST" });
+    applyProjectPauseState(project);
     applyRun(run);
+    pollTasks();
   } catch (err) {
     pushLog({ at: new Date().toISOString(), kind: "error", message: err.message });
   }
@@ -3054,6 +3259,10 @@ async function startIteration() {
     return;
   }
   if (!S.current || !S.project) return;
+  if (S.project.paused) {
+    alert("Проект на паузе — сначала продолжите прогон, потом запускайте доработку.");
+    return;
+  }
   const btn = $("#iterateBtn");
   btn.disabled = true;
   try {
@@ -3284,15 +3493,49 @@ async function loadDiff(run, baseId = null) {
 
 /* --------------------------- угловой чат --------------------------- */
 
+const CORNER_TABS = [
+  ["critical", "Критичное", "ошибок и падений нет"],
+  ["notice", "Оповещения", "гейтов и завершений нет"],
+  ["chat", "Чат", "напиши Харнессу — начнём переписку"],
+];
+
+function cornerTabMeta(tab) {
+  return CORNER_TABS.find(([id]) => id === tab) ?? CORNER_TABS[0];
+}
+
+function applyCornerSummary(tabs, unread) {
+  if (tabs && typeof tabs === "object") S.corner.tabs = tabs;
+  if (Number.isFinite(Number(unread))) S.corner.unread = Number(unread);
+  renderCornerCounts();
+}
+
+function renderCornerCounts() {
+  const tabs = S.corner.tabs ?? {};
+  for (const [id] of CORNER_TABS) {
+    const count = tabs[id]?.unread ?? 0;
+    document.querySelectorAll(`[data-ctab-count="${id}"]`).forEach((node) => {
+      node.textContent = count > 99 ? "99+" : String(count);
+      node.classList.toggle("zero", !count);
+    });
+  }
+  document.querySelectorAll("#cornerTabs button").forEach((b) => b.classList.toggle("active", b.dataset.ctab === S.corner.tab));
+  const badge = $("#cornerBadge");
+  if (badge) {
+    const total = Number(S.corner.unread ?? 0);
+    badge.classList.toggle("hidden", total === 0);
+    badge.textContent = total > 99 ? "99+" : String(total);
+  }
+}
+
 async function pollCorner() {
   if (S.authDead) return;
   try {
-    const [mb, al] = await Promise.all([api("/api/mailbox?limit=60"), api("/api/alerts")]);
-    S.corner = { items: mb.items ?? [], unread: mb.unread ?? 0, alerts: al.alerts ?? [] };
-    const badge = $("#cornerBadge");
-    const total = (S.corner.unread ?? 0) + (S.corner.alerts ?? []).length;
-    badge.classList.toggle("hidden", total === 0);
-    badge.textContent = total > 99 ? "99+" : String(total);
+    const [mb, al] = await Promise.all([api("/api/mailbox?limit=200"), api("/api/alerts")]);
+    S.corner.items = mb.items ?? [];
+    S.corner.tabs = mb.tabs ?? {};
+    S.corner.unread = mb.unread ?? 0;
+    S.corner.alerts = al.alerts ?? [];
+    renderCornerCounts();
     if (!$("#cornerPanel").classList.contains("hidden")) renderCorner();
   } catch {
     /* сервер занят */
@@ -3300,20 +3543,92 @@ async function pollCorner() {
 }
 
 function renderCorner() {
+  const tab = S.corner.tab;
+  const [, title, emptyText] = cornerTabMeta(tab);
   const box = $("#cornerLog");
   box.textContent = "";
-  for (const m of S.corner.items.slice(-40)) {
-    const node = el("div", "cmsg " + m.from + (m.level ? " " + m.level : ""), m.text);
+  const items = (S.corner.items ?? []).filter((m) => (m.tab ?? "notice") === tab).slice(-60);
+  for (const m of items) {
+    const node = el("div", "cmsg " + m.from + (m.level ? " " + m.level : "") + (m.read ? "" : " unread"), m.text);
     const who = m.from === "user" ? "ты" : m.from === "harness" ? "харнесс" : m.from === "assistant" ? "ассистент портала" : "портал";
     node.prepend(el("span", "who", `${who} · ${hhmmss(m.at)}`));
+    if (!m.read && canWrite()) {
+      const read = el("button", "mini cmsgRead", "прочитать");
+      read.title = "Отметить это сообщение прочитанным";
+      read.addEventListener("click", () => markCornerRead(m.id));
+      node.append(read);
+    }
     box.append(node);
   }
-  if (!S.corner.items.length) box.append(el("div", "empty", "тут появятся события портала и наша переписка"));
+  if (!items.length) box.append(el("div", "empty", emptyText));
 
-  const alerts = $("#cornerAlerts");
-  alerts.textContent = "";
-  for (const a of S.corner.alerts) alerts.append(el("div", "alert " + (a.level === "bad" ? "bad" : ""), a.text));
+  // Живые алерты наблюдателя не входят в счётчики: это условие, а не письмо.
+  // Показываем их в подходящей вкладке, но не дублируем те, что уже есть в почте.
+  const alertsBox = $("#cornerAlerts");
+  if (alertsBox) {
+    alertsBox.textContent = "";
+    const live = (S.corner.alerts ?? []).filter(
+      (a) => (a.tab ?? (a.level === "bad" || a.level === "error" ? "critical" : "notice")) === tab && !items.some((m) => m.text === a.text)
+    );
+    alertsBox.classList.toggle("hidden", live.length === 0);
+    if (live.length) {
+      alertsBox.append(el("div", "caHead", "наблюдатель · не в счётчике"));
+      for (const a of live) alertsBox.append(el("div", "alert " + (a.level === "bad" ? "bad" : ""), a.text));
+    }
+  }
+
+  const info = $("#cornerTabInfo");
+  if (info) info.textContent = `${title.toLowerCase()} · ${items.length} сообщ.`;
+  document.querySelectorAll("#cornerTabs button").forEach((b) => b.classList.toggle("active", b.dataset.ctab === tab));
   box.scrollTop = box.scrollHeight;
+}
+
+function setCornerTab(tab) {
+  if (!CORNER_TABS.some(([id]) => id === tab)) return;
+  S.corner.tab = tab;
+  renderCorner();
+}
+
+async function markCornerRead(id) {
+  if (!id || !canWrite()) return;
+  try {
+    const res = await api("/api/mailbox/read", { method: "POST", body: JSON.stringify({ ids: [id] }) });
+    applyCornerSummary(res.tabs, res.unread);
+    await pollCorner();
+  } catch (err) {
+    pushLog({ at: new Date().toISOString(), kind: "error", message: err.message });
+  }
+}
+
+async function readCornerTab() {
+  if (!canWrite()) return;
+  const tab = S.corner.tab;
+  try {
+    const res = await api("/api/mailbox/read", { method: "POST", body: JSON.stringify({ tab }) });
+    applyCornerSummary(res.tabs, res.unread);
+    await pollCorner();
+  } catch (err) {
+    pushLog({ at: new Date().toISOString(), kind: "error", message: err.message });
+  }
+}
+
+async function clearCornerTab() {
+  if (!canWrite()) return;
+  const tab = S.corner.tab;
+  const [, title] = cornerTabMeta(tab);
+  if (tab === "critical") {
+    if (!confirm(`Удалить все сообщения вкладки «${title}»? Это ошибки, падения и остановки.`)) return;
+    if (!confirm("Точно удалить критичные сообщения? Отменить это будет нельзя.")) return;
+  } else if (!confirm(`Очистить вкладку «${title}»? Сообщения удалятся безвозвратно.`)) {
+    return;
+  }
+  try {
+    const res = await api("/api/mailbox/clear", { method: "POST", body: JSON.stringify({ tab }) });
+    applyCornerSummary(res.tabs, res.unread);
+    await pollCorner();
+  } catch (err) {
+    pushLog({ at: new Date().toISOString(), kind: "error", message: err.message });
+  }
 }
 
 async function sendCorner() {
@@ -3326,6 +3641,7 @@ async function sendCorner() {
     await api("/api/mailbox", { method: "POST", body: JSON.stringify({ text, from: "user" }) });
     const reply = await api("/api/assistant", { method: "POST", body: JSON.stringify({ question: text }) }).catch(() => null);
     if (reply?.answer) await api("/api/mailbox", { method: "POST", body: JSON.stringify({ text: reply.answer, from: "assistant" }) });
+    S.corner.tab = "chat";
     await pollCorner();
   } catch (err) {
     pushLog({ at: new Date().toISOString(), kind: "error", message: err.message });
@@ -3513,18 +3829,28 @@ $("#imgFile").addEventListener("change", (e) => {
   e.target.value = "";
 });
 
-$("#cornerBtn").addEventListener("click", async () => {  const panel = $("#cornerPanel");
+$("#runPause").addEventListener("click", () => {
+  if (!S.current) return;
+  if (S.current.status === "paused") resumeRun(S.current.id);
+  else pauseProjectRun(S.current.id);
+});
+
+$("#cornerBtn").addEventListener("click", async () => {
+  const panel = $("#cornerPanel");
   panel.classList.toggle("hidden");
   if (!panel.classList.contains("hidden")) {
     renderCorner();
     $("#cornerInput").focus();
     await pollCorner();
-    const shown = (S.corner.items ?? []).slice(-40).map((m) => m.id);
-    if (shown.length) api("/api/mailbox/read", { method: "POST", body: JSON.stringify({ ids: shown }) }).catch(() => {});
     setTimeout(pollCorner, 800);
   }
 });
 $("#cornerClose").addEventListener("click", () => $("#cornerPanel").classList.add("hidden"));
+document.querySelectorAll("#cornerTabs button").forEach((b) => {
+  b.addEventListener("click", () => setCornerTab(b.dataset.ctab));
+});
+$("#cornerReadAll").addEventListener("click", readCornerTab);
+$("#cornerClear").addEventListener("click", clearCornerTab);
 $("#cornerSend").addEventListener("click", sendCorner);
 $("#cornerInput").addEventListener("keydown", (e) => {
   if (e.key === "Enter") sendCorner();
