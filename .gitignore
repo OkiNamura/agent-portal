@@ -18,3 +18,4 @@ node_modules/
 *.tmp
 tmp-docx-test.docx
 config/users.json
+snapshots/
