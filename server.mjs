@@ -11,6 +11,7 @@ import { Projects } from "./lib/projects.mjs";
 import { Engine } from "./lib/engine.mjs";
 import { isMock, extractJson } from "./lib/llm.mjs";
 import { listModels, chat } from "./lib/openrouter.mjs";
+import { getProviders, testProvider } from "./lib/providers.mjs";
 import { diffWorkspaces } from "./lib/diff.mjs";
 import { agentMetrics, verdictSummary } from "./lib/metrics.mjs";
 import { Mailbox } from "./lib/mailbox.mjs";
@@ -174,6 +175,9 @@ function syncKeyToEnv() {
   if (k?.key) process.env.OPENROUTER_API_KEY = k.key;
 }
 syncKeyToEnv();
+
+/* Провайдеры: один экземпляр на процесс — его же видят llm.mjs и studio.mjs. */
+const providers = getProviders();
 
 const mailbox = new Mailbox(ROOT);
 const studio = new Studio(ROOT);
@@ -1653,6 +1657,8 @@ const server = http.createServer(async (req, res) => {
         port: PORT,
         agents: config.agents,
         pipeline: config.pipeline,
+        providers: providers.list(),
+        defaultProvider: providers.defaultId(),
         runs,
         projects: projectList(),
       });
@@ -1687,11 +1693,12 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (pathname === "/api/models" && req.method === "GET") {
+      const providerId = url.searchParams.get("provider") ?? "";
       try {
-        const models = await getModels();
-        return json(res, 200, { models });
+        const models = await getModels(providerId || null);
+        return json(res, 200, { models, provider: providerId || providers.defaultId() });
       } catch (err) {
-        return json(res, 200, { models: [], error: String(err?.message || err) });
+        return json(res, 200, { models: [], provider: providerId || providers.defaultId(), error: String(err?.message || err) });
       }
     }
 
@@ -2184,6 +2191,67 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { agents: config.agents, preset });
     }
 
+    /* ---------- провайдеры: OpenRouter и любые OpenAI-совместимые ---------- */
+
+    if (pathname === "/api/providers" && method === "GET") {
+      return json(res, 200, { providers: providers.list(), default: providers.defaultId() });
+    }
+
+    if (pathname === "/api/providers" && method === "POST") {
+      if (user.role !== "admin") return json(res, 403, { error: "провайдеров меняет администратор" });
+      const body = await readBody(req);
+      try {
+        const out = providers.add(body);
+        // ключ — только в config/keys.json, в providers.json его не пишем
+        if (Object.prototype.hasOwnProperty.call(body, "apiKey")) keys.setProviderKey(out.provider.id, body.apiKey);
+        invalidateModelCaches();
+        const list = providers.list();
+        return json(res, 201, { ok: true, ...out, provider: list.find((p) => p.id === out.provider.id) ?? out.provider, providers: list });
+      } catch (err) {
+        return json(res, 400, { error: String(err?.message || err) });
+      }
+    }
+
+    const provm = pathname.match(/^\/api\/providers\/([\w.-]+)(?:\/(test))?$/);
+    if (provm) {
+      const [, providerId, action] = provm;
+      if (action === "test" && method === "POST") {
+        const provider = providers.get(providerId);
+        if (!provider) return json(res, 404, { error: `Провайдер «${providerId}» не найден` });
+        const result = await testProvider(provider);
+        return json(res, 200, {
+          provider: provider.id,
+          name: provider.name,
+          baseUrl: provider.baseUrl,
+          ...result,
+        });
+      }
+      if (!action && method === "POST") {
+        if (user.role !== "admin") return json(res, 403, { error: "провайдеров меняет администратор" });
+        const body = await readBody(req);
+        try {
+          const out = providers.update(providerId, body);
+          if (Object.prototype.hasOwnProperty.call(body, "apiKey")) keys.setProviderKey(out.provider.id, body.apiKey);
+          invalidateModelCaches();
+          const list = providers.list();
+          return json(res, 200, { ok: true, ...out, provider: list.find((p) => p.id === out.provider.id) ?? out.provider, providers: list });
+        } catch (err) {
+          return json(res, 400, { error: String(err?.message || err) });
+        }
+      }
+      if (!action && method === "DELETE") {
+        if (user.role !== "admin") return json(res, 403, { error: "провайдеров удаляет администратор" });
+        try {
+          const out = providers.remove(providerId);
+          keys.setProviderKey(providerId, "");
+          invalidateModelCaches();
+          return json(res, 200, { ok: true, ...out, providers: providers.list() });
+        } catch (err) {
+          return json(res, 400, { error: String(err?.message || err) });
+        }
+      }
+    }
+
     if (pathname === "/api/prices" && req.method === "GET") {
       return json(res, 200, { image: IMAGE_PRICES, note: "оценка по данным OpenRouter, точная цена — в чеке после генерации" });
     }
@@ -2342,6 +2410,7 @@ const server = http.createServer(async (req, res) => {
           temperature: Number(agent.temperature ?? 0.3),
           maxTokens: 4000,
           apiKey: keys.resolve(agent.id)?.key ?? null,
+          provider: providers.forAgent(agent),
           system: agent.prompt,
           user: `Режим: ${mode}. ${mode === "correct" ? "Только орфография и пунктуация, смысл и формулировки не менять." : "Можно переписать и структурировать."}\n\nТекст заказчика:\n"""\n${text}\n"""`,
         });
@@ -2402,6 +2471,7 @@ const server = http.createServer(async (req, res) => {
             temperature: Number(agent.temperature ?? 0.2),
             maxTokens: 6000,
             apiKey: keys.resolve(agent.id)?.key ?? null,
+            provider: providers.forAgent(agent),
             system: `${agent.prompt}\n\nТы собираешь структуру презентации: только JSON, без markdown. Заголовки и пункты — по-русски, пункты короткие.`,
             user: deckPromptFor(previous, text, slideCount),
           });
@@ -2475,6 +2545,7 @@ const server = http.createServer(async (req, res) => {
           temperature: Number(agent.temperature ?? 0.2),
           maxTokens: 6000,
           apiKey: keys.resolve(agent.id)?.key ?? null,
+          provider: providers.forAgent(agent),
           system: `${agent.prompt}\n\nТы пишешь не код, а спеку-договор в markdown по описанию заказчика. Пиши по-русски.`,
           user: specPromptFor(previous, text),
         });
@@ -2547,6 +2618,7 @@ const server = http.createServer(async (req, res) => {
           temperature: Number(master.temperature ?? 0.4),
           maxTokens: 4000,
           apiKey: keys.resolve(master.id)?.key ?? null,
+          provider: providers.forAgent(master),
           system: master.prompt ?? PROMPT_ENGINEER_SYSTEM,
           user: textPromptFor(previous, text),
         });
@@ -2748,7 +2820,7 @@ const server = http.createServer(async (req, res) => {
         if (!refItem) return json(res, 404, { error: "Референс не найден" });
         if (library.isDeleted(imageRef(refItem.id))) return json(res, 409, { error: "Референс в корзине — сначала восстановите его" });
       }
-      if (isMock()) return json(res, 502, { error: "MOCK-режим: картинки не генерируются без ключа" });
+      if (process.env.MOCK === "1") return json(res, 502, { error: "MOCK-режим: картинки не генерируются без ключа" });
       if (refItem) {
         references.push(studio.dataUrl(refItem));
         refId = refItem.id;
@@ -2756,6 +2828,13 @@ const server = http.createServer(async (req, res) => {
 
       const imgKey = keys.resolve("studio");
       const requested = String(body.model ?? "google/gemini-3.1-flash-image");
+      let imageProvider;
+      try {
+        imageProvider = imageProviderFor(body.provider);
+      } catch (err) {
+        return json(res, 400, { error: String(err?.message || err) });
+      }
+      if (isMock()) return json(res, 502, { error: "MOCK-режим: картинки не генерируются без ключа" });
       try {
         let out;
         let usedModel = requested;
@@ -2764,19 +2843,21 @@ const server = http.createServer(async (req, res) => {
             model: requested,
             prompt,
             apiKey: imgKey?.key,
+            provider: imageProvider,
             aspectRatio: body.aspectRatio ? String(body.aspectRatio) : undefined,
             quality: body.quality ? String(body.quality) : undefined,
             references,
           });
         } catch (err) {
           // повторяем только когда модель не приняла параметры; 401/402/таймаут не ретраим — это деньги
-          if (requested === "google/gemini-3.1-flash-image") throw err;
+          if (imageProvider.kind !== "openrouter" || requested === "google/gemini-3.1-flash-image") throw err;
           if (!/\((400|422)\)/.test(String(err?.message || ""))) throw err;
           usedModel = "google/gemini-3.1-flash-image";
           out = await generateImage({
             model: usedModel,
             prompt,
             apiKey: imgKey?.key,
+            provider: imageProvider,
             aspectRatio: body.aspectRatio ? String(body.aspectRatio) : undefined,
             references,
           });
@@ -2810,9 +2891,11 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === "/api/images/models" && req.method === "GET") {
       try {
-        return json(res, 200, { models: await imageModels() });
+        const providerId = url.searchParams.get("provider") || null;
+        const provider = imageProviderFor(providerId);
+        return json(res, 200, { models: await imageModels(provider.id), provider: provider.id });
       } catch (err) {
-        return json(res, 200, { models: [], error: err.message });
+        return json(res, 200, { models: [], error: String(err?.message || err) });
       }
     }
 
@@ -2831,7 +2914,7 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req, 14_000_000);
       const prompt = String(body.prompt ?? "").trim();
       if (prompt.length < 2) return json(res, 400, { error: "Пустой промт" });
-      if (isMock()) return json(res, 502, { error: "MOCK-режим: картинки не генерируются без ключа" });
+      if (process.env.MOCK === "1") return json(res, 502, { error: "MOCK-режим: картинки не генерируются без ключа" });
 
       const model = String(body.model ?? "google/gemini-3.1-flash-image");
       const references = [];
@@ -2846,10 +2929,19 @@ const server = http.createServer(async (req, res) => {
         references.push(body.reference);
       }
 
+      let provider;
+      try {
+        provider = imageProviderFor(body.provider);
+      } catch (err) {
+        return json(res, 400, { error: String(err?.message || err) });
+      }
+      if (isMock()) return json(res, 502, { error: "MOCK-режим: картинки не генерируются без ключа" });
+
       try {
         const out = await generateImage({
           model,
           prompt,
+          provider,
           aspectRatio: body.aspectRatio ? String(body.aspectRatio) : undefined,
           quality: body.quality ? String(body.quality) : undefined,
           resolution: body.resolution ? String(body.resolution) : undefined,
@@ -3163,11 +3255,19 @@ const server = http.createServer(async (req, res) => {
 
 /** Художник: переписывает человеческий запрос в промт и объясняет, как понял задачу. */
 async function makeProposal(text, referenceId = null, sessionId = undefined) {
-  if (isMock()) return { error: "MOCK-режим: художник не работает без ключа" };
+  if (process.env.MOCK === "1") return { error: "MOCK-режим: художник не работает без ключа" };
   const refItem = referenceId ? studio.get(String(referenceId)) : null;
   if (refItem && library.isDeleted(imageRef(refItem.id))) return { error: "Референс в корзине — сначала восстановите его" };
   const refNote = refItem ? `\n\nЗаказчик приложил картинку-референс (${refItem.id}). Это запрос на правку: опиши в промте, что менять, а что оставить, и используй формулировки вроде "keep the composition".` : "";
-  const models = await imageModels().catch(() => []);
+  const agent = engine.agent("artist");
+  let provider;
+  try {
+    provider = providers.forAgent(agent);
+  } catch (err) {
+    return { error: String(err?.message || err) };
+  }
+  if (isMock()) return { error: "MOCK-режим: художник не работает без ключа" };
+  const models = await imageModels(provider.id).catch(() => []);
   const blocked = /(vector|krea|edit|upscal|inpaint)/i;
   const list = models
     .map((m) => m.id)
@@ -3175,12 +3275,12 @@ async function makeProposal(text, referenceId = null, sessionId = undefined) {
     .slice(0, 40)
     .join(", ");
 
-  const agent = engine.agent("artist");
   const started = Date.now();
   try {
     const out = await chat({
       model: agent.model,
       apiKey: keys.resolve("artist")?.key ?? null,
+      provider,
       temperature: Number(agent.temperature ?? 0.4),
       maxTokens: 1200,
       system: agent.prompt,
@@ -3254,7 +3354,7 @@ function assistantContext() {
 
 async function assistantAnswer(question, history) {
   const ctx = assistantContext();
-  if (isMock()) {
+  if (process.env.MOCK === "1") {
     return { answer: `MOCK-режим: модель не вызывается, показываю данные портала.\n\n${ctx.slice(0, 1600)}`, model: "mock/assistant", cost: 0 };
   }
   const agent = (config.agents.agents ?? []).find((a) => a.id === "assistant") ?? {
@@ -3262,6 +3362,10 @@ async function assistantAnswer(question, history) {
     temperature: 0.2,
     prompt: "Ты — ассистент портала. Отвечай по данным, которые дали. Не выдумывай.",
   };
+  const provider = providers.forAgent(agent);
+  if (isMock()) {
+    return { answer: `MOCK-режим: модель не вызывается, показываю данные портала.\n\n${ctx.slice(0, 1600)}`, model: "mock/assistant", cost: 0 };
+  }
   const hist = (history ?? [])
     .filter((m) => m && m.text && m.role !== "error")
     .slice(-6)
@@ -3271,6 +3375,7 @@ async function assistantAnswer(question, history) {
   const res = await chat({
     model: agent.model,
     apiKey: keys.resolve("assistant")?.key ?? null,
+    provider,
     temperature: Number(agent.temperature ?? 0.2),
     maxTokens: 1200,
     system: agent.prompt,
@@ -3281,22 +3386,48 @@ async function assistantAnswer(question, history) {
 
 /* --------------------------- models cache --------------------------- */
 
-let modelsCache = { at: 0, models: [] };
-async function getModels() {
+const modelsCache = new Map(); // providerId -> {at, models}
+const imgModelsCache = new Map();
+
+/** Провайдер для картинок: явный id → провайдер художника → default. */
+function imageProviderFor(providerId = null) {
+  if (providerId) {
+    const p = providers.get(String(providerId));
+    if (!p) throw new Error(`Провайдер «${providerId}» не найден`);
+    if (p.enabled === false) throw new Error(`Провайдер «${p.name}» выключен — включи его в разделе «Ключи» → «Провайдеры».`);
+    return p;
+  }
+  let artist = null;
+  try {
+    artist = engine.agent("artist");
+  } catch {
+    /* конфиг без художника — берём default */
+  }
+  return artist ? providers.forAgent(artist) : providers.defaultProvider();
+}
+
+function invalidateModelCaches() {
+  modelsCache.clear();
+  imgModelsCache.clear();
+}
+
+async function getModels(providerId = null) {
   if (isMock()) return [];
-  const fresh = Date.now() - modelsCache.at < 3600_000;
-  if (fresh && modelsCache.models.length) return modelsCache.models;
-  const models = await listModels();
-  modelsCache = { at: Date.now(), models };
+  const provider = providerId ? providers.require(providerId) : providers.defaultProvider();
+  const cached = modelsCache.get(provider.id);
+  if (cached && Date.now() - cached.at < 3600_000 && cached.models.length) return cached.models;
+  const models = await listModels({ provider });
+  modelsCache.set(provider.id, { at: Date.now(), models });
   return models;
 }
 
-let imgModelsCache = { at: 0, models: [] };
-async function imageModels() {
-  const fresh = Date.now() - imgModelsCache.at < 3600_000;
-  if (fresh && imgModelsCache.models.length) return imgModelsCache.models;
-  const models = await listImageModels();
-  imgModelsCache = { at: Date.now(), models };
+async function imageModels(providerId = null) {
+  if (isMock()) return [];
+  const provider = providerId ? providers.require(providerId) : imageProviderFor(null);
+  const cached = imgModelsCache.get(provider.id);
+  if (cached && Date.now() - cached.at < 3600_000 && cached.models.length) return cached.models;
+  const models = await listImageModels({ provider });
+  imgModelsCache.set(provider.id, { at: Date.now(), models });
   return models;
 }
 
@@ -3316,10 +3447,10 @@ const broadcast = setInterval(() => {
 broadcast.unref?.();
 
 server.listen(PORT, "127.0.0.1", () => {
-  const mode = isMock() ? "MOCK (без ключа, без трат)" : "LIVE (OpenRouter)";
+  const mode = isMock() ? "MOCK (без провайдера, без трат)" : `LIVE (${providers.defaultProvider().name})`;
   console.log(`\n  Agent Portal  ·  http://127.0.0.1:${PORT}`);
   console.log(`  Режим: ${mode}`);
-  console.log(`  Конфиг: config/agents.json, config/pipeline.json`);
+  console.log(`  Конфиг: config/agents.json, config/pipeline.json, config/providers.json`);
   console.log(`  Вход: /api/login · роли viewer / editor / admin`);
   console.log(`  Прогоны: runs/\n`);
 });

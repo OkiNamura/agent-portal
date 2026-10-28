@@ -31,6 +31,10 @@ const S = {
   raw: false,
   models: [],
   modelsTried: false,
+  modelsByProvider: {},
+  modelsTriedByProvider: {},
+  providers: [],
+  defaultProvider: null,
   logCutoff: 0,
   metrics: null,
   studio: { thread: [], models: [], sessions: [], activeId: null, refItem: null, refData: null, lastText: "", view: "all", collapsed: {} },
@@ -371,6 +375,8 @@ async function boot() {
     S.agentsFile = st.agents;
     S.pipelineFile = st.pipeline;
     S.agents = st.agents.agents;
+    S.providers = st.providers ?? [];
+    S.defaultProvider = st.defaultProvider ?? null;
     S.stages = st.pipeline.stages.filter((s) => s.enabled !== false);
     S.projects = st.projects ?? [];
     renderMode(st);
@@ -397,7 +403,8 @@ async function boot() {
 function renderMode(st) {
   const live = st.mode === "live";
   const b = $("#modeBadge");
-  b.textContent = live ? "LIVE · OpenRouter" : "MOCK · без ключа";
+  const def = S.providers.find((p) => p.id === S.defaultProvider) ?? S.providers.find((p) => p.isDefault);
+  b.textContent = live ? `LIVE · ${def?.name || "API"}` : "MOCK · без провайдера";
   b.className = "badge " + (live ? "live" : "mock");
 }
 
@@ -1564,6 +1571,16 @@ async function loadKeys() {
   }
   box.textContent = "";
 
+  // провайдеры: свой запрос — в /api/keys их нет (и ключей там тоже нет)
+  try {
+    const prov = await api("/api/providers");
+    S.providers = prov.providers ?? S.providers;
+    S.defaultProvider = prov.default ?? S.defaultProvider;
+  } catch {
+    /* если сервер старый — просто покажем ключи OpenRouter */
+  }
+  renderProvidersBlock(box);
+
   // пресеты
   box.append(el("div", "sectionTitle", "Быстрая настройка моделей"));
   const presets = el("div", "presetRow");
@@ -1702,8 +1719,228 @@ async function loadKeys() {
   if (S.role === "admin") box.append(await renderUsersCard());
 }
 
-async function renderUsersCard() {
-  const card = el("div", "card");
+/* ---------------------------- провайдеры ---------------------------- */
+
+function providerName(id) {
+  return S.providers.find((p) => p.id === id)?.name ?? id ?? "—";
+}
+
+function defaultProviderId() {
+  return S.defaultProvider || S.providers.find((p) => p.isDefault)?.id || "";
+}
+
+function providerForm({ provider = null, submitLabel = "Добавить", onSubmit }) {
+  const isEdit = Boolean(provider);
+  const form = el("div", "keyForm provForm");
+  const grid = el("div", "provGrid");
+
+  const nameL = el("label", "label", "Название");
+  const nameI = document.createElement("input");
+  nameI.placeholder = "LM Studio, Ollama, vLLM…";
+  nameI.value = provider?.name ?? "";
+  nameL.append(nameI);
+
+  const idL = el("label", "label", "id (латиница)");
+  const idI = document.createElement("input");
+  idI.placeholder = "lmstudio";
+  idI.value = provider?.id ?? "";
+  idI.disabled = isEdit;
+  idI.title = "Короткий id для config/agents.json: provider=\"lmstudio\"";
+  idL.append(idI);
+
+  const urlL = el("label", "label", "Base URL");
+  const urlI = document.createElement("input");
+  urlI.placeholder = "http://127.0.0.1:1234/v1";
+  urlI.value = provider?.baseUrl ?? "";
+  urlL.append(urlI);
+
+  const kindL = el("label", "label", "Тип API");
+  const kindI = document.createElement("select");
+  kindI.className = "miniSelect";
+  for (const [value, text] of [
+    ["openai", "OpenAI-совместимый"],
+    ["openrouter", "OpenRouter"],
+  ]) {
+    const o = document.createElement("option");
+    o.value = value;
+    o.textContent = text;
+    kindI.append(o);
+  }
+  kindI.value = provider?.kind ?? "openai";
+  kindL.append(kindI);
+
+  const envL = el("label", "label", "Переменная окружения с ключом");
+  const envI = document.createElement("input");
+  envI.placeholder = provider?.kind === "openrouter" ? "OPENROUTER_API_KEY" : "напр. LMSTUDIO_API_KEY (необязательно)";
+  envI.value = provider?.apiKeyEnv ?? "";
+  envL.append(envI);
+
+  const keyL = el("label", "label", isEdit ? "Новый ключ (пусто — не менять)" : "Ключ (необязательно для локальных)");
+  const keyI = document.createElement("input");
+  keyI.type = "password";
+  keyI.placeholder = "хранится в config/keys.json, не в providers.json";
+  keyL.append(keyI);
+
+  grid.append(nameL, idL, urlL, kindL, envL, keyL);
+
+  const enabledL = el("label", "chk");
+  const enabledI = document.createElement("input");
+  enabledI.type = "checkbox";
+  enabledI.checked = provider ? provider.enabled !== false : true;
+  enabledL.append(enabledI, document.createTextNode(" включён"));
+
+  const submit = el("button", "primary", submitLabel);
+  submit.type = "button";
+  submit.addEventListener("click", async () => {
+    submit.disabled = true;
+    try {
+      const payload = {
+        name: nameI.value.trim(),
+        baseUrl: urlI.value.trim(),
+        kind: kindI.value,
+        apiKeyEnv: envI.value.trim(),
+        enabled: enabledI.checked,
+      };
+      if (!isEdit) payload.id = idI.value.trim();
+      if (keyI.value.trim()) payload.apiKey = keyI.value.trim();
+      await onSubmit(payload);
+      if (!isEdit) {
+        nameI.value = "";
+        idI.value = "";
+        urlI.value = "";
+        envI.value = "";
+        keyI.value = "";
+      }
+    } catch (err) {
+      alert("Не сохранилось: " + err.message);
+    } finally {
+      submit.disabled = false;
+    }
+  });
+
+  form.append(grid, enabledL, submit);
+  return form;
+}
+
+async function afterProviderChange() {
+  const prov = await api("/api/providers");
+  S.providers = prov.providers ?? [];
+  S.defaultProvider = prov.default ?? null;
+  // модели зависят от провайдера — кэш сбрасываем
+  S.modelsByProvider = {};
+  S.modelsTriedByProvider = {};
+  S.studio.models = [];
+  await loadKeys();
+}
+
+function renderProvidersBlock(box) {
+  box.append(el("div", "sectionTitle", "Провайдеры"));
+  box.append(
+    el(
+      "div",
+      "dim",
+      "OpenRouter и любые OpenAI-совместимые шлюзы: LM Studio, Ollama, vLLM, llama.cpp. baseUrl — корень API, обычно с /v1. Ключи хранятся в config/keys.json или в переменной окружения, в providers.json их нет."
+    )
+  );
+
+  const list = el("div", "keysList");
+  for (const p of S.providers) {
+    const card = el("div", "keyCard provCard");
+    const head = el("div", "keyHead");
+    head.append(el("b", null, p.name), el("span", "dim", p.id));
+    if (p.id === defaultProviderId() || p.isDefault) head.append(el("span", "tag", "по умолчанию"));
+    head.append(el("span", "tag" + (p.enabled ? "" : " off"), p.enabled ? "включён" : "выключен"));
+
+    const meta = el("div", "facts");
+    meta.append(
+      el("span", "dim", p.baseUrl),
+      el("span", "dim", p.kind === "openrouter" ? "OpenRouter" : "OpenAI-совместимый"),
+      el("span", "dim", p.hasKey ? "ключ есть" : p.kind === "openai" ? "без ключа (локальный)" : "ключа нет")
+    );
+    if (p.apiKeyEnv) meta.append(el("span", "dim", `env: ${p.apiKeyEnv}`));
+
+    const testLine = el("div", "provTest dim");
+    const acts = el("div", "keyActs");
+
+    const test = el("button", "mini", "Проверить");
+    test.type = "button";
+    test.title = "GET {baseUrl}/models: сколько моделей и за какое время";
+    test.addEventListener("click", async () => {
+      test.disabled = true;
+      testLine.className = "provTest dim";
+      testLine.textContent = "проверяю…";
+      try {
+        const res = await api(`/api/providers/${encodeURIComponent(p.id)}/test`, { method: "POST" });
+        if (res.ok) {
+          testLine.className = "provTest ok";
+          testLine.textContent = `✓ ${res.models?.length ?? 0} моделей · ${res.ms} мс${res.models?.length ? ` · ${res.models.slice(0, 3).join(", ")}` : ""}`;
+        } else {
+          testLine.className = "provTest bad";
+          testLine.textContent = `✗ ${res.error || "нет связи"}`;
+        }
+      } catch (err) {
+        testLine.className = "provTest bad";
+        testLine.textContent = `✗ ${err.message}`;
+      } finally {
+        test.disabled = false;
+      }
+    });
+    acts.append(test);
+
+    const admin = S.role === "admin";
+    let editWrap = null;
+    if (admin) {
+      const edit = el("button", "mini", "изменить");
+      edit.type = "button";
+      editWrap = el("div", "provEdit hidden");
+      editWrap.append(
+        providerForm({
+          provider: p,
+          submitLabel: "Сохранить",
+          onSubmit: async (payload) => {
+            await api(`/api/providers/${encodeURIComponent(p.id)}`, { method: "POST", body: JSON.stringify(payload) });
+            await afterProviderChange();
+          },
+        })
+      );
+      edit.addEventListener("click", () => editWrap.classList.toggle("hidden"));
+      const del = el("button", "mini danger", "удалить");
+      del.type = "button";
+      del.addEventListener("click", async () => {
+        if (!confirm(`Удалить провайдера «${p.name}»?`)) return;
+        try {
+          await api(`/api/providers/${encodeURIComponent(p.id)}`, { method: "DELETE" });
+          await afterProviderChange();
+        } catch (err) {
+          alert("Не удалилось: " + err.message);
+        }
+      });
+      acts.append(edit, del);
+    }
+
+    card.append(head, meta, acts, testLine);
+    if (editWrap) card.append(editWrap);
+    list.append(card);
+  }
+  if (!S.providers.length) list.append(el("div", "empty", "Провайдеров пока нет."));
+  box.append(list);
+
+  if (S.role === "admin") {
+    box.append(el("div", "sectionTitle", "Добавить провайдера"));
+    box.append(
+      providerForm({
+        submitLabel: "Добавить",
+        onSubmit: async (payload) => {
+          await api("/api/providers", { method: "POST", body: JSON.stringify(payload) });
+          await afterProviderChange();
+        },
+      })
+    );
+  }
+  box.append(el("div", "hint", "Локальный провайдер может работать без ключа. Ключ шлюза хранится в config/keys.json, в providers.json попадают только id, baseUrl, тип и флаг enabled."));
+}
+
+async function renderUsersCard() {  const card = el("div", "card");
   card.id = "usersCard";
   card.append(el("div", "sectionTitle", "Пользователи и роли"));
   card.append(el("div", "dim", "viewer — только чтение; editor — прогоны и настройки, кроме ключей, пользователей и удаления проектов; admin — всё."));
@@ -2152,20 +2389,68 @@ function renderAgentEditor() {
   g2.append(nameL, roleL);
   card.append(g2);
 
-  const modelL = el("label", "label", "Модель (OpenRouter id)");
+  /* провайдер и модель: список моделей — из /models выбранного провайдера */
+  const selectedProvider = a.provider || "";
+  const providerL = el("label", "label", "Провайдер");
+  const providerI = document.createElement("select");
+  providerI.className = "miniSelect";
+  const autoProvider = document.createElement("option");
+  autoProvider.value = "";
+  autoProvider.textContent = `по умолчанию${defaultProviderId() ? ` (${providerName(defaultProviderId())})` : ""}`;
+  providerI.append(autoProvider);
+  for (const p of S.providers) {
+    const o = document.createElement("option");
+    o.value = p.id;
+    o.textContent = `${p.name}${p.enabled ? "" : " · выключен"}`;
+    providerI.append(o);
+  }
+  if (selectedProvider && !S.providers.some((p) => p.id === selectedProvider)) {
+    const o = document.createElement("option");
+    o.value = selectedProvider;
+    o.textContent = `${selectedProvider} · нет в списке`;
+    providerI.append(o);
+  }
+  providerI.value = selectedProvider;
+  providerL.append(providerI);
+
+  const modelLabel = (pid) => `Модель (${pid ? providerName(pid) : "по умолчанию"})`;
+  const modelL = el("label", "label");
+  const modelTitle = el("span", null, modelLabel(selectedProvider));
   const modelI = el("input");
   modelI.value = a.model || "";
   modelI.setAttribute("list", "modelList");
+  modelI.placeholder = "id модели";
   const dl = document.createElement("datalist");
   dl.id = "modelList";
-  for (const m of S.models) {
-    const opt = document.createElement("option");
-    opt.value = m.id;
-    opt.label = `${m.id} · $${(m.promptPrice * 1e6).toFixed(2)} / $${(m.completionPrice * 1e6).toFixed(2)}`;
-    dl.append(opt);
-  }
-  modelL.append(modelI, dl);
-  card.append(modelL);
+
+  const fillModels = (pid) => {
+    dl.textContent = "";
+    for (const m of modelsForProvider(pid)) {
+      const opt = document.createElement("option");
+      opt.value = m.id;
+      const priced = Number(m.promptPrice) > 0 || Number(m.completionPrice) > 0;
+      const price = priced ? ` · $${(Number(m.promptPrice) * 1e6).toFixed(2)} / $${(Number(m.completionPrice) * 1e6).toFixed(2)} за 1M` : "";
+      opt.label = `${m.name && m.name !== m.id ? m.name + " · " : ""}${m.id}${price}`;
+      dl.append(opt);
+    }
+  };
+  fillModels(selectedProvider);
+
+  providerI.addEventListener("change", async () => {
+    const pid = providerI.value;
+    modelTitle.textContent = modelLabel(pid);
+    fillModels(pid);
+    if (!S.modelsByProvider[pid] && !S.modelsTriedByProvider[pid]) {
+      S.modelsTriedByProvider[pid] = true;
+      await loadModels(pid);
+      if (S.editingAgent?.id === a.id) fillModels(pid);
+    }
+  });
+
+  modelL.append(modelTitle, modelI, dl);
+  const modelRow = el("div", "grid2");
+  modelRow.append(providerL, modelL);
+  card.append(modelRow);
 
   const tempL = el("label", "label", "Температура");
   const tempI = el("input");
@@ -2190,6 +2475,8 @@ function renderAgentEditor() {
     a.name = nameI.value.trim() || a.id;
     a.role = roleI.value.trim();
     a.model = modelI.value.trim();
+    if (providerI.value) a.provider = providerI.value;
+    else delete a.provider;
     a.temperature = Number(tempI.value);
     a.prompt = promptI.value;
     saveAgents();
@@ -2202,10 +2489,11 @@ function renderAgentEditor() {
   box.append(card);
   renderAgentStats(a);
   if (a.id === "harness") renderHarnessSettings(a);
-  if (!S.models.length && !S.modelsTried) {
-    S.modelsTried = true;
-    loadModels().then(() => {
-      if (S.models.length && S.editingAgent?.id === a.id) renderAgentEditor();
+  const startPid = selectedProvider;
+  if (!S.modelsByProvider[startPid] && !S.modelsTriedByProvider[startPid] && S.mode !== "mock") {
+    S.modelsTriedByProvider[startPid] = true;
+    loadModels(startPid).then(() => {
+      if (S.editingAgent?.id === a.id && (S.editingAgent.provider || "") === startPid) renderAgentEditor();
     });
   }
 }
@@ -2238,14 +2526,24 @@ async function renderAgentStats(a) {  const box = $("#agentEditor");
   box.append(card);
 }
 
-async function loadModels() {
-  if (S.models.length || S.mode === "mock") return;
+function modelsForProvider(providerId) {
+  return S.modelsByProvider[providerId || ""] ?? [];
+}
+
+/** Список моделей конкретного провайдера (для openai — его собственный /models). */
+async function loadModels(providerId = "") {
+  const key = providerId || "";
+  if (S.modelsByProvider[key]) return S.modelsByProvider[key];
+  if (S.mode === "mock") return [];
   try {
-    const { models } = await api("/api/models");
-    S.models = models;
+    const q = key ? `?provider=${encodeURIComponent(key)}` : "";
+    const { models } = await api(`/api/models${q}`);
+    S.modelsByProvider[key] = models ?? [];
   } catch {
-    /* можно вписать вручную */
+    S.modelsByProvider[key] = [];
+    /* модель можно вписать вручную */
   }
+  return S.modelsByProvider[key];
 }
 
 async function saveAgents() {
