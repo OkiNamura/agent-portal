@@ -22,6 +22,23 @@ import { Library, normalizeView, parseRef, matchesView } from "./lib/library.mjs
 import { buildProjectZipEntries, zipStream } from "./lib/zip-pack.mjs";
 import { Keys, PRESETS } from "./lib/keys.mjs";
 import {
+  AgentError,
+  ASSIST_ASK_SYSTEM,
+  ASSIST_JSON_SYSTEM,
+  agentUsage,
+  applyAgentPatch,
+  assistAskPrompt,
+  assistUserPrompt,
+  buildAgentCopy,
+  buildAgentForCreate,
+  buildAgentPatch,
+  mockAssistAnswer,
+  mockAssistProposal,
+  normalizeAssistProposal,
+  usageConflictMessage,
+  writeAgentsFileAtomic,
+} from "./lib/agents-admin.mjs";
+import {
   SESSION_COOKIE,
   SESSION_MAX_AGE,
   loadUsers,
@@ -147,6 +164,18 @@ bus.setMaxListeners(200);
 const keys = new Keys(ROOT);
 const engine = new Engine({ store, config, bus, keys });
 engine.spendProvider = keySpendFromLogs;
+
+/**
+ * Записать agents.json атомарно и сразу применить изменения.
+ * engine.agent(id) читает this.config.agents.agents, поэтому одного
+ * обновления объекта config мало — явно отдаём движку тот же config.
+ */
+function applyAgentsFile(nextAgents) {
+  writeAgentsFileAtomic(CONFIG_DIR, nextAgents);
+  config.agents = nextAgents;
+  engine.config = config;
+  return nextAgents;
+}
 
 /**
  * Ручной возврат блока: комментарий заказчика кладём в block.userDefects,
@@ -668,6 +697,35 @@ const readBody = (req, limit = 2_000_000) =>
     });
     req.on("error", reject);
   });
+
+/** Мутирующие операции с агентами — только admin (editor/viewer получают 403). */
+function requireAdmin(res, user, message = "агентами управляет администратор") {
+  if (user?.role === "admin") return true;
+  json(res, 403, { error: message });
+  return false;
+}
+
+/** Ошибку валидации агента отдаём с её HTTP-статусом, остальное — 400. */
+function agentFailure(res, err) {
+  const status = err instanceof AgentError ? err.status : 400;
+  return json(res, status, { error: String(err?.message || err) });
+}
+
+/** Только известные поля текущего агента: мусор из UI в промт не попадает. */
+function currentAgentOf(value) {
+  if (!value || typeof value !== "object") return null;
+  const out = {};
+  for (const key of ["id", "name", "role", "kind", "model", "provider", "temperature", "prompt"]) {
+    if (value[key] !== undefined && value[key] !== null) out[key] = value[key];
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+/** Провайдер/модель/промт для помощника: promptmaster, иначе assistant. */
+function assistAgent() {
+  const list = config.agents.agents ?? [];
+  return list.find((a) => a.id === "promptmaster") ?? list.find((a) => a.id === "assistant") ?? null;
+}
 
 /* ------------------------- ограничение попыток входа ------------------------- */
 
@@ -1679,13 +1737,18 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === "/api/config" && req.method === "POST") {
       const body = await readBody(req);
+      // Агентами управляет только admin: старый «сохранить весь конфиг» не должен
+      // быть обходом новых проверок для editor.
+      if (body.agents !== undefined && user.role !== "admin") {
+        return json(res, 403, { error: "агентами управляет администратор" });
+      }
       const next = {
         agents: body.agents ?? config.agents,
         pipeline: body.pipeline ?? config.pipeline,
       };
       if (!Array.isArray(next.agents?.agents)) return json(res, 400, { error: "agents.agents должен быть массивом" });
       if (!Array.isArray(next.pipeline?.stages)) return json(res, 400, { error: "pipeline.stages должен быть массивом" });
-      fs.writeFileSync(path.join(CONFIG_DIR, "agents.json"), JSON.stringify(next.agents, null, 2), "utf8");
+      writeAgentsFileAtomic(CONFIG_DIR, next.agents);
       fs.writeFileSync(path.join(CONFIG_DIR, "pipeline.json"), JSON.stringify(next.pipeline, null, 2), "utf8");
       config = next;
       engine.config = next;
@@ -1902,18 +1965,123 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, removed, freed: removed.length });
     }
 
+    /* ------------------- агенты: ручное управление ------------------- */
+
+    /*
+     * Помощник настройки. В MOCK отдаёт детерминированную заглушку той же
+     * структуры, в LIVE — просит promptmaster (иначе assistant) вернуть JSON.
+     * mode:"ask" — свободный вопрос, ответ текстом. В конфиг ничего не пишет:
+     * изменения применяет только отдельный POST /api/agents(/:id).
+     */
+    if (pathname === "/api/agents/assist" && method === "POST") {
+      if (!requireAdmin(res, user)) return;
+      const body = await readBody(req);
+      // suggest — по умолчанию; ask — свободный вопрос текстом. Поддерживаем
+      // несколько очевидных форм, чтобы UI и скрипты не зависели от одной.
+      const ask = body.mode === "ask" || body.ask === true || body.kind === "ask" || (body.question !== undefined && body.text === undefined);
+      const text = String(body.text ?? body.question ?? "").trim();
+      if (text.length < 2) return json(res, 400, { error: ask ? "Пустой вопрос" : "Опиши, какой агент нужен (минимум 2 символа)" });
+      const current = currentAgentOf(body.current);
+      const chosen = assistAgent();
+      const agentId = chosen?.id ?? null;
+
+      if (isMock()) {
+        if (ask) {
+          return json(res, 200, { ok: true, mode: "ask", answer: mockAssistAnswer(text), agent: agentId, model: "mock/assist", cost: 0 });
+        }
+        const proposal = mockAssistProposal(text, { current, defaultProvider: providers.defaultId() });
+        return json(res, 200, { ok: true, mode: "suggest", ...proposal, proposal, agent: agentId, modelUsed: "mock/assist", cost: 0 });
+      }
+
+      const modelAgent = chosen ?? { model: "deepseek/deepseek-v3.2", temperature: 0.2 };
+      try {
+        const provider = providers.forAgent(modelAgent);
+        const out = await chat({
+          model: modelAgent.model,
+          apiKey: keys.resolve(agentId ?? "assistant")?.key ?? null,
+          provider,
+          temperature: Number(modelAgent.temperature ?? 0.3),
+          maxTokens: ask ? 1200 : 2000,
+          system: ask ? ASSIST_ASK_SYSTEM : ASSIST_JSON_SYSTEM,
+          user: ask ? assistAskPrompt(text, current) : assistUserPrompt(text, current, providers),
+        });
+        if (ask) {
+          return json(res, 200, { ok: true, mode: "ask", answer: out.text.trim(), agent: agentId, model: out.model, cost: out.usage?.cost ?? 0 });
+        }
+        const proposal = normalizeAssistProposal(extractJson(out.text), {
+          current,
+          providers,
+          defaultProvider: providers.defaultId(),
+        });
+        return json(res, 200, { ok: true, mode: "suggest", ...proposal, proposal, agent: agentId, modelUsed: out.model, cost: out.usage?.cost ?? 0 });
+      } catch (err) {
+        return json(res, 502, { error: String(err?.message || err) });
+      }
+    }
+
+    if (pathname === "/api/agents" && method === "POST") {
+      if (!requireAdmin(res, user)) return;
+      try {
+        const body = await readBody(req);
+        const list = config.agents.agents ?? [];
+        const agent = buildAgentForCreate(body, { providers, existingIds: list.map((a) => a.id) });
+        const next = { ...config.agents, agents: [...list, agent] };
+        applyAgentsFile(next);
+        return json(res, 200, { ok: true, agent, agents: next });
+      } catch (err) {
+        return agentFailure(res, err);
+      }
+    }
+
+    const duplicateAgent = pathname.match(/^\/api\/agents\/([\w.-]+)\/duplicate$/);
+    if (duplicateAgent && method === "POST") {
+      if (!requireAdmin(res, user)) return;
+      const id = duplicateAgent[1];
+      const list = config.agents.agents ?? [];
+      const source = list.find((a) => a.id === id);
+      if (!source) return json(res, 404, { error: "Агент не найден" });
+      try {
+        const copy = buildAgentCopy(source, list.map((a) => a.id));
+        const next = { ...config.agents, agents: [...list, copy] };
+        applyAgentsFile(next);
+        return json(res, 200, { ok: true, agent: copy, source: id, agents: next });
+      } catch (err) {
+        return agentFailure(res, err);
+      }
+    }
+
     const am = pathname.match(/^\/api\/agents\/([\w.-]+)$/);
-    if (am && req.method === "DELETE") {
+    if (am && method === "POST") {
+      if (!requireAdmin(res, user)) return;
       const id = am[1];
-      const used = (config.pipeline.stages ?? []).filter((s) => s.agent === id).map((s) => s.title);
-      if (used.length) return json(res, 409, { error: `Агент занят стадиями: ${used.join(", ")}` });
+      const list = config.agents.agents ?? [];
+      const current = list.find((a) => a.id === id);
+      if (!current) return json(res, 404, { error: "Агент не найден" });
+      try {
+        const body = await readBody(req);
+        const patch = buildAgentPatch(body, { providers, current });
+        const updated = applyAgentPatch(current, patch);
+        const next = { ...config.agents, agents: list.map((a) => (a.id === id ? updated : a)) };
+        applyAgentsFile(next);
+        return json(res, 200, { ok: true, agent: updated, agents: next });
+      } catch (err) {
+        return agentFailure(res, err);
+      }
+    }
+
+    if (am && method === "DELETE") {
+      if (!requireAdmin(res, user)) return;
+      const id = am[1];
       const list = config.agents.agents ?? [];
       if (!list.some((a) => a.id === id)) return json(res, 404, { error: "Агент не найден" });
+      // Проверка занятости: стадия конвейера или прямой вызов из кода портала.
+      const uses = agentUsage(id, config.pipeline);
+      if (uses.length) {
+        return json(res, 409, { error: usageConflictMessage(id, uses), usage: uses });
+      }
       const next = { ...config.agents, agents: list.filter((a) => a.id !== id) };
-      fs.writeFileSync(path.join(CONFIG_DIR, "agents.json"), JSON.stringify(next, null, 2), "utf8");
-      config = { ...config, agents: next };
-      engine.config = config;
-      return json(res, 200, { ok: true, agents: next });
+      applyAgentsFile(next);
+      return json(res, 200, { ok: true, removed: id, agents: next });
     }
 
     if (pathname === "/api/tasks" && req.method === "GET") {
@@ -2187,7 +2355,7 @@ const server = http.createServer(async (req, res) => {
         if (a.kind === "external") continue;
         if (map[a.id]) a.model = map[a.id];
       }
-      fs.writeFileSync(path.join(CONFIG_DIR, "agents.json"), JSON.stringify(config.agents, null, 2), "utf8");
+      applyAgentsFile(config.agents);
       return json(res, 200, { agents: config.agents, preset });
     }
 

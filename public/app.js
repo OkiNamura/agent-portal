@@ -23,6 +23,9 @@ const S = {
   runs: [],
   current: null,
   editingAgent: null,
+  agentDraft: false,
+  assistProposal: null,
+  assistAnswer: "",
   stream: null,
   lastSeq: 0,
   artSig: "",
@@ -137,6 +140,10 @@ function libViewValue(raw) {
 
 function canWrite() {
   return S.role === "admin" || S.role === "editor";
+}
+
+function isAdmin() {
+  return S.role === "admin";
 }
 
 function initLibraryUi() {
@@ -422,6 +429,10 @@ function setPage(page) {
   $("#pageSearch").classList.toggle("hidden", page !== "search");
   $("#pageAssistant").classList.toggle("hidden", page !== "assistant");
   renderList();
+  if (page === "agents") {
+    renderAgentEditor();
+    renderAgentAssist();
+  }
   if (page === "stats") loadStats();
   if (page === "studio") loadStudio();
   if (page === "gallery") loadGallery();
@@ -478,26 +489,35 @@ function renderList() {
   if (S.page === "agents") {
     const head = el("div", "listHead");
     head.append(el("span", null, "Агенты"));
-    const add = el("button", "mini", "+");
-    add.title = "Добавить агента";
+    const add = el("button", "mini agentAdminOnly", "+ Новый агент");
+    add.type = "button";
+    add.title = "Создать агента вручную";
     add.addEventListener("click", addAgent);
     head.append(add);
     box.append(head);
 
     for (const a of S.agents) {
-      const item = el("div", "item" + (S.editingAgent?.id === a.id ? " active" : ""));
+      const item = el("div", "item" + (!S.agentDraft && S.editingAgent?.id === a.id ? " active" : ""));
       const txt = el("div", "txt");
       const n = el("div", "n");
       n.append(el("span", null, a.name));
       if (a.kind === "external") n.append(el("span", "tag", "чат"));
       txt.append(n, el("div", "m", a.model || "—"));
+      const dup = el("button", "kill agentAdminOnly", "⧉");
+      dup.type = "button";
+      dup.title = "Дублировать агента";
+      dup.addEventListener("click", (e) => {
+        e.stopPropagation();
+        duplicateAgent(a);
+      });
       const kill = el("button", "kill", "✕");
+      kill.type = "button";
       kill.title = "Удалить агента";
       kill.addEventListener("click", (e) => {
         e.stopPropagation();
         deleteAgent(a);
       });
-      item.append(txt, kill);
+      item.append(txt, dup, kill);
       item.addEventListener("click", () => selectAgent(a.id));
       box.append(item);
     }
@@ -2357,37 +2377,94 @@ function renderProjectHead() {
 
 /* ------------------------------- agents ------------------------------- */
 
+function showAgentError(message = "") {
+  const box = $("#agentError");
+  if (!box) return;
+  box.textContent = String(message ?? "");
+  box.classList.toggle("hidden", !message);
+}
+
+function setAssistError(message = "") {
+  const box = $("#assistError");
+  if (!box) return;
+  box.textContent = String(message ?? "");
+  box.classList.toggle("hidden", !message);
+}
+
+/** Черновик: агент ещё не сохранён через POST /api/agents. */
+function isAgentDraft() {
+  const a = S.editingAgent;
+  return Boolean(a && (S.agentDraft || !S.agents.some((x) => x.id === a.id)));
+}
+
+/** Только поля агента — без служебных флагов UI. */
+function agentCurrentFields(a) {
+  if (!a) return null;
+  const out = {};
+  for (const key of ["id", "name", "role", "kind", "model", "provider", "temperature", "prompt"]) {
+    if (a[key] !== undefined && a[key] !== null) out[key] = a[key];
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+/** Ответ create/update/duplicate/delete: обновляем и список, и файл конфига. */
+function applyAgentsResponse(res) {
+  if (!res?.agents) return;
+  S.agentsFile = res.agents;
+  S.agents = res.agents.agents ?? [];
+}
+
 function selectAgent(id) {
-  setPage("agents");
   S.editingAgent = S.agents.find((a) => a.id === id) ?? null;
-  renderList();
-  renderAgentEditor();
+  S.agentDraft = false;
+  S.assistProposal = null;
+  S.assistAnswer = "";
+  showAgentError("");
+  // setPage сам перерисует список, редактор и панель помощника.
+  setPage("agents");
 }
 
 function renderAgentEditor() {
   const box = $("#agentEditor");
+  if (!box) return;
   box.textContent = "";
   const a = S.editingAgent;
   if (!a) {
-    box.append(el("div", "empty", "Выбери агента слева или добавь нового."));
+    box.append(el("div", "empty", "Выбери агента слева или создай нового кнопкой «+ Новый агент»."));
     return;
   }
+  const draft = isAgentDraft();
+
   const card = el("div", "card");
   const facts = el("div", "facts");
-  facts.append(el("span", null, `id: ${a.id}`), el("span", null, a.kind === "external" ? "внешний (чат)" : "модель по API"));
+  facts.append(el("span", null, draft ? "новый агент — ещё не сохранён" : `id: ${a.id}`));
+  facts.append(el("span", null, a.kind === "external" ? "внешний (чат)" : "модель по API"));
+  if (!isAdmin()) facts.append(el("span", null, "изменять и удалять может только admin"));
   card.append(facts);
 
   const g2 = el("div", "grid2");
   const nameL = el("label", "label", "Имя");
   const nameI = el("input");
-  nameI.value = a.name;
+  nameI.value = a.name || "";
+  nameI.placeholder = "Например: Помощник по договорам";
   nameL.append(nameI);
   const roleL = el("label", "label", "Роль");
   const roleI = el("input");
   roleI.value = a.role || "";
+  roleI.placeholder = "Например: проверка договоров";
   roleL.append(roleI);
   g2.append(nameL, roleL);
   card.append(g2);
+
+  let idI = null;
+  if (draft) {
+    const idL = el("label", "label", "id (необязательно)");
+    idI = el("input");
+    idI.value = a.id || "";
+    idI.placeholder = "сгенерируется из имени";
+    idL.append(idI);
+    card.append(idL);
+  }
 
   /* провайдер и модель: список моделей — из /models выбранного провайдера */
   const selectedProvider = a.provider || "";
@@ -2443,7 +2520,7 @@ function renderAgentEditor() {
     if (!S.modelsByProvider[pid] && !S.modelsTriedByProvider[pid]) {
       S.modelsTriedByProvider[pid] = true;
       await loadModels(pid);
-      if (S.editingAgent?.id === a.id) fillModels(pid);
+      if (S.editingAgent === a) fillModels(pid);
     }
   });
 
@@ -2452,7 +2529,7 @@ function renderAgentEditor() {
   modelRow.append(providerL, modelL);
   card.append(modelRow);
 
-  const tempL = el("label", "label", "Температура");
+  const tempL = el("label", "label", "Температура (0–2)");
   const tempI = el("input");
   tempI.type = "number";
   tempI.min = "0";
@@ -2466,34 +2543,104 @@ function renderAgentEditor() {
   const promptI = el("textarea");
   promptI.rows = 8;
   promptI.value = a.prompt || "";
+  promptI.placeholder = "Опиши, кто агент, что делает, чего не делает и в каком виде отвечает.";
   promptL.append(promptI);
   card.append(promptL);
 
   const actions = el("div", "actions");
-  const save = el("button", "primary", "Сохранить");
-  save.addEventListener("click", () => {
-    a.name = nameI.value.trim() || a.id;
-    a.role = roleI.value.trim();
-    a.model = modelI.value.trim();
-    if (providerI.value) a.provider = providerI.value;
-    else delete a.provider;
-    a.temperature = Number(tempI.value);
-    a.prompt = promptI.value;
-    saveAgents();
+  const readForm = () => {
+    const tempRaw = tempI.value.trim();
+    const temperature = Number(tempRaw);
+    if (!tempRaw || !Number.isFinite(temperature) || temperature < 0 || temperature > 2) {
+      throw new Error("Температура: число от 0 до 2");
+    }
+    const payload = {
+      name: nameI.value.trim(),
+      role: roleI.value.trim(),
+      model: modelI.value.trim(),
+      temperature,
+      prompt: promptI.value,
+    };
+    if (!payload.name) throw new Error("Имя: не может быть пустым");
+    if (!payload.model) throw new Error("Модель: не может быть пустым");
+    if (!payload.prompt.trim()) throw new Error("Промт: не может быть пустым");
+    if (draft) {
+      payload.kind = a.kind || "llm";
+      if (idI.value.trim()) payload.id = idI.value.trim();
+      if (providerI.value) payload.provider = providerI.value;
+    } else {
+      // пустой провайдер — вернуть «по умолчанию», поэтому отправляем всегда
+      payload.provider = providerI.value;
+    }
+    return payload;
+  };
+
+  const save = el("button", "primary agentAdminOnly", draft ? "Создать агента" : "Сохранить");
+  save.addEventListener("click", async () => {
+    showAgentError("");
+    let payload;
+    try {
+      payload = readForm();
+    } catch (err) {
+      showAgentError(err.message);
+      return;
+    }
+    save.disabled = true;
+    const label = save.textContent;
+    save.textContent = "Сохраняю…";
+    try {
+      const res = await api(draft ? "/api/agents" : `/api/agents/${a.id}`, {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      applyAgentsResponse(res);
+      S.editingAgent = res.agent ?? res.agents?.agents?.find((x) => x.id === (res.agent?.id ?? payload.id)) ?? null;
+      S.agentDraft = false;
+      S.assistProposal = null;
+      S.assistAnswer = "";
+      showAgentError("");
+      renderList();
+      renderAgentEditor();
+      renderAgentAssist();
+    } catch (err) {
+      showAgentError(err.message);
+    } finally {
+      save.disabled = false;
+      save.textContent = label;
+    }
   });
-  const del = el("button", "danger", "Удалить");
-  del.addEventListener("click", () => deleteAgent(a));
-  actions.append(del, save);
+
+  if (draft) {
+    const cancel = el("button", "mini", "Отмена");
+    cancel.addEventListener("click", () => {
+      S.agentDraft = false;
+      S.editingAgent = null;
+      showAgentError("");
+      renderList();
+      renderAgentEditor();
+      renderAgentAssist();
+    });
+    actions.append(cancel, save);
+  } else {
+    const del = el("button", "danger agentAdminOnly", "Удалить");
+    del.addEventListener("click", () => deleteAgent(a));
+    const dup = el("button", "agentAdminOnly", "Дублировать");
+    dup.addEventListener("click", () => duplicateAgent(a));
+    actions.append(del, dup, save);
+  }
   card.append(actions);
 
   box.append(card);
-  renderAgentStats(a);
-  if (a.id === "harness") renderHarnessSettings(a);
+  if (!draft) {
+    renderAgentStats(a);
+    if (a.id === "harness") renderHarnessSettings(a);
+  }
   const startPid = selectedProvider;
   if (!S.modelsByProvider[startPid] && !S.modelsTriedByProvider[startPid] && S.mode !== "mock") {
     S.modelsTriedByProvider[startPid] = true;
     loadModels(startPid).then(() => {
-      if (S.editingAgent?.id === a.id && (S.editingAgent.provider || "") === startPid) renderAgentEditor();
+      // только дополняем datalist: полный ререндер стёр бы несохранённые правки формы
+      if (S.editingAgent === a && (S.editingAgent.provider || "") === startPid) fillModels(startPid);
     });
   }
 }
@@ -2546,41 +2693,295 @@ async function loadModels(providerId = "") {
   return S.modelsByProvider[key];
 }
 
-async function saveAgents() {
+function addAgent() {
+  S.agentDraft = true;
+  S.editingAgent = {
+    id: "",
+    name: "",
+    role: "",
+    kind: "llm",
+    model: "deepseek/deepseek-v3.2",
+    temperature: 0.3,
+    prompt: "",
+    provider: S.defaultProvider || "",
+  };
+  S.assistProposal = null;
+  S.assistAnswer = "";
+  showAgentError("");
+  setPage("agents");
+  setTimeout(() => $("#agentEditor input")?.focus(), 40);
+}
+
+async function duplicateAgent(a) {
+  showAgentError("");
   try {
-    const res = await api("/api/config", {
-      method: "POST",
-      body: JSON.stringify({ agents: { ...S.agentsFile, agents: S.agents }, pipeline: S.pipelineFile }),
-    });
-    S.agentsFile = res.agents;
-    S.agents = res.agents.agents;
+    const res = await api(`/api/agents/${a.id}/duplicate`, { method: "POST" });
+    applyAgentsResponse(res);
+    S.agentDraft = false;
+    S.editingAgent = res.agent;
+    S.assistProposal = null;
+    S.assistAnswer = "";
     renderList();
     renderAgentEditor();
+    renderAgentAssist();
   } catch (err) {
-    alert("Не сохранилось: " + err.message);
+    showAgentError(err.message);
   }
 }
 
-function addAgent() {
-  setPage("agents");
-  const id = `agent-${Math.random().toString(36).slice(2, 6)}`;
-  const agent = { id, name: "Новый агент", role: "", kind: "llm", model: "deepseek/deepseek-v3.2", temperature: 0.3, prompt: "" };
-  S.agents.push(agent);
-  S.editingAgent = agent;
-  renderList();
-  renderAgentEditor();
-}
-
 async function deleteAgent(a) {
-  if (!confirm(`Удалить агента «${a.name}»?`)) return;
+  if (!confirm(`Удалить агента «${a.name}»? Это действие нельзя отменить.`)) return;
+  showAgentError("");
   try {
     const res = await api(`/api/agents/${a.id}`, { method: "DELETE" });
-    S.agents = res.agents.agents;
-    if (S.editingAgent?.id === a.id) S.editingAgent = null;
+    applyAgentsResponse(res);
+    if (S.editingAgent?.id === a.id) {
+      S.editingAgent = null;
+      S.agentDraft = false;
+    }
+    S.assistProposal = null;
+    S.assistAnswer = "";
     renderList();
     renderAgentEditor();
+    renderAgentAssist();
   } catch (err) {
-    alert(err.message);
+    // 409: агент занят стадией конвейера или кодом портала — сервер прислал список мест
+    showAgentError(err.message);
+  }
+}
+
+/* --------------------------- помощник агента --------------------------- */
+
+function renderAgentAssist() {
+  const ctx = $("#assistContext");
+  if (ctx) {
+    const a = S.editingAgent;
+    if (!a) ctx.textContent = "агент не выбран";
+    else if (isAgentDraft()) ctx.textContent = "новый агент (ещё не сохранён)";
+    else ctx.textContent = `текущий: ${a.name || a.id}`;
+  }
+  renderAssistProposal();
+  renderAssistAnswer();
+}
+
+function renderAssistAnswer() {
+  const box = $("#assistAnswer");
+  if (!box) return;
+  box.textContent = S.assistAnswer || "";
+  box.classList.toggle("hidden", !S.assistAnswer);
+}
+
+function resetAssistProposal() {
+  S.assistProposal = null;
+  setAssistError("");
+  renderAssistProposal();
+}
+
+function clearAssist() {
+  S.assistProposal = null;
+  S.assistAnswer = "";
+  const text = $("#assistText");
+  const question = $("#assistQuestion");
+  if (text) text.value = "";
+  if (question) question.value = "";
+  setAssistError("");
+  renderAgentAssist();
+}
+
+function assistDiffRow(label, was, became, changed) {
+  const row = el("div", "agentDiffRow" + (changed ? " changed" : ""));
+  row.append(el("div", "k", label));
+  const v = el("div", "v");
+  v.append(el("div", "old", `было: ${was === "" || was == null ? "—" : was}`));
+  v.append(el("div", "new", `стало: ${became === "" || became == null ? "—" : became}`));
+  row.append(v);
+  return row;
+}
+
+function renderAssistProposal() {
+  const box = $("#assistProposal");
+  if (!box) return;
+  box.textContent = "";
+  const p = S.assistProposal;
+  if (!p) {
+    box.classList.add("hidden");
+    return;
+  }
+  box.classList.remove("hidden");
+
+  const head = el("div", "assistHead");
+  head.append(el("b", null, "Предложение"));
+  head.append(el("span", "dim", p.agent ? ` · ${p.agent}` : ""));
+  box.append(head);
+  if (p.note) box.append(el("div", "assistNote", p.note));
+
+  // Предложение как поля (только для чтения) + diff ниже. Менять конфиг
+  // можно лишь кнопкой «Применить».
+  const fieldsBox = el("div", "assistFields");
+  const addField = (label, value, multiline = false) => {
+    const l = el("label", "label", label);
+    const input = document.createElement(multiline ? "textarea" : "input");
+    input.value = value == null ? "" : String(value);
+    input.readOnly = true;
+    if (multiline) input.rows = 5;
+    l.append(input);
+    fieldsBox.append(l);
+  };
+  addField("Имя", p.name);
+  addField("Роль", p.role);
+  addField("id", p.id);
+  addField("Модель", p.model);
+  addField("Провайдер", p.provider || "по умолчанию");
+  addField("Температура", p.temperature);
+  addField("Промт", p.prompt, true);
+  box.append(fieldsBox);
+
+  const current = agentCurrentFields(S.editingAgent) ?? {};
+  const fields = [
+    ["name", "Имя"],
+    ["role", "Роль"],
+    ["id", "id"],
+    ["model", "Модель"],
+    ["provider", "Провайдер"],
+    ["temperature", "Температура"],
+    ["prompt", "Промт"],
+  ];
+  const diff = el("div", "agentDiff");
+  for (const [key, label] of fields) {
+    const was = current[key] ?? (key === "id" && isAgentDraft() ? "сгенерируется" : "—");
+    const became = key === "provider" && !p[key] ? "по умолчанию" : p[key] ?? "—";
+    diff.append(assistDiffRow(label, String(was), String(became), String(was) !== String(became)));
+  }
+  box.append(diff);
+
+  const actions = el("div", "actions");
+  const reset = el("button", "mini", "Сбросить");
+  reset.type = "button";
+  reset.addEventListener("click", resetAssistProposal);
+  const apply = el("button", "primary agentAdminOnly", "Применить");
+  apply.type = "button";
+  apply.addEventListener("click", () => applyAssistProposal(apply));
+  actions.append(reset, apply);
+  box.append(actions);
+}
+
+async function applyAssistProposal(button = null) {
+  const p = S.assistProposal;
+  if (!p) return;
+  setAssistError("");
+  const current = S.editingAgent;
+  const draft = !current || isAgentDraft();
+  const payload = {
+    name: p.name,
+    role: p.role,
+    model: p.model,
+    temperature: Number(p.temperature),
+    prompt: p.prompt,
+    provider: p.provider || "",
+  };
+  if (draft) {
+    payload.id = p.id;
+    payload.kind = current?.kind || "llm";
+  }
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Применяю…";
+  }
+  try {
+    const res = await api(draft ? "/api/agents" : `/api/agents/${current.id}`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    applyAgentsResponse(res);
+    S.agentDraft = false;
+    S.editingAgent = res.agent ?? S.agents.find((x) => x.id === (res.agent?.id ?? p.id)) ?? null;
+    S.assistProposal = null;
+    S.assistAnswer = "";
+    showAgentError("");
+    renderList();
+    renderAgentEditor();
+    renderAgentAssist();
+  } catch (err) {
+    setAssistError(err.message);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = "Применить";
+    }
+  }
+}
+
+async function assistSuggest() {
+  const text = $("#assistText")?.value.trim() ?? "";
+  if (text.length < 2) {
+    setAssistError("Опиши, какой агент нужен (минимум 2 символа).");
+    return;
+  }
+  setAssistError("");
+  const button = $("#assistSuggest");
+  const label = button?.textContent ?? "Предложить";
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Думаю…";
+  }
+  try {
+    const current = isAgentDraft() ? undefined : agentCurrentFields(S.editingAgent);
+    const res = await api("/api/agents/assist", {
+      method: "POST",
+      body: JSON.stringify({ text, current: current ?? undefined }),
+    });
+    const proposal = res.proposal ?? res;
+    S.assistProposal = {
+      name: proposal.name,
+      role: proposal.role,
+      id: proposal.id,
+      model: proposal.model,
+      provider: proposal.provider,
+      temperature: proposal.temperature,
+      prompt: proposal.prompt,
+      note: proposal.note,
+      agent: res.agent ?? null,
+    };
+    S.assistAnswer = "";
+    renderAgentAssist();
+  } catch (err) {
+    setAssistError(err.message);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = label;
+    }
+  }
+}
+
+async function assistAsk() {
+  const question = $("#assistQuestion")?.value.trim() ?? "";
+  if (!question) {
+    setAssistError("Напиши вопрос про настройки агента.");
+    return;
+  }
+  setAssistError("");
+  const button = $("#assistAskBtn");
+  const label = button?.textContent ?? "Спросить";
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Спрашиваю…";
+  }
+  try {
+    const current = isAgentDraft() ? undefined : agentCurrentFields(S.editingAgent);
+    const res = await api("/api/agents/assist", {
+      method: "POST",
+      body: JSON.stringify({ text: question, mode: "ask", current: current ?? undefined }),
+    });
+    S.assistAnswer = String(res.answer ?? "").trim();
+    renderAssistAnswer();
+  } catch (err) {
+    setAssistError(err.message);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = label;
+    }
   }
 }
 
@@ -4152,6 +4553,14 @@ $("#cornerClear").addEventListener("click", clearCornerTab);
 $("#cornerSend").addEventListener("click", sendCorner);
 $("#cornerInput").addEventListener("keydown", (e) => {
   if (e.key === "Enter") sendCorner();
+});
+
+/* помощник на странице «Агенты» */
+$("#assistSuggest").addEventListener("click", assistSuggest);
+$("#assistClear").addEventListener("click", clearAssist);
+$("#assistAskBtn").addEventListener("click", assistAsk);
+$("#assistQuestion").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") assistAsk();
 });
 
 boot();

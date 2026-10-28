@@ -149,7 +149,29 @@
         <h1>Агенты и модели</h1>
         <div class="dim">Клик по агенту слева — настройка. Провайдер и модель выбираются вручную, список моделей подтягивается из выбранного провайдера.</div>
       </div>
-      <div id="agentEditor" class="agentEditor"></div>
+      <div id="agentError" class="agentError hidden"></div>
+      <div class="agentsLayout">
+        <div id="agentEditor" class="agentEditor"></div>
+        <aside id="agentAssist" class="agentAssist">
+          <div class="assistHead"><b>Помощник агента</b><span id="assistContext" class="dim">агент не выбран</span></div>
+          <label class="label">Опиши, какой агент нужен
+            <textarea id="assistText" rows="4" placeholder="Например: агент, который проверяет тексты на ошибки и объясняет правки"></textarea>
+          </label>
+          <div class="row end">
+            <button id="assistClear" class="mini" type="button">Очистить</button>
+            <button id="assistSuggest" class="primary" type="button">Предложить</button>
+          </div>
+          <div id="assistError" class="agentError hidden"></div>
+          <div id="assistProposal" class="assistProposal hidden"></div>
+          <div class="assistAsk">
+            <label class="label">Свободный вопрос
+              <input id="assistQuestion" placeholder="что даёт температура 0.1 против 0.7?" />
+            </label>
+            <div class="row end"><button id="assistAskBtn" class="mini" type="button">Спросить про настройки</button></div>
+            <div id="assistAnswer" class="assistAnswer hidden"></div>
+          </div>
+        </aside>
+      </div>
     </div>
 
     <!-- СТУДИЯ -->
