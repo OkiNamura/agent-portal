@@ -2534,14 +2534,20 @@ const server = http.createServer(async (req, res) => {
 
       const started = Date.now();
       try {
-        // отдельный системный промт в server.mjs, модель берём у художника (ключ тот же)
-        const artist = engine.agent("artist");
+        // отдельный агент «Мастер промтов»: его промт и модель, без привязки к художнику
+        const master = (() => {
+          try {
+            return engine.agent("promptmaster");
+          } catch {
+            return engine.agent("artist");
+          }
+        })();
         const out = await chat({
-          model: artist.model,
-          temperature: Number(artist.temperature ?? 0.4),
+          model: master.model,
+          temperature: Number(master.temperature ?? 0.4),
           maxTokens: 4000,
-          apiKey: keys.resolve(artist.id)?.key ?? null,
-          system: PROMPT_ENGINEER_SYSTEM,
+          apiKey: keys.resolve(master.id)?.key ?? null,
+          system: master.prompt ?? PROMPT_ENGINEER_SYSTEM,
           user: textPromptFor(previous, text),
         });
         let data;
